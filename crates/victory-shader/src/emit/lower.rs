@@ -12,6 +12,7 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::uniform::lane_uniform;
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -449,167 +450,6 @@ fn need(block: usize) {
             n.push(block);
         }
     });
-}
-
-/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
-/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
-/// constants and such values; or loaded from an address made of them. The compiler keeps
-/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
-/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
-/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-/// `ds_read*` sites `(block, inst)` whose shared memory is written only earlier in the
-/// program, separated from the read by an `s_barrier`, with no backward branch from or
-/// after the read looping back over an LDS write.
-fn lds_stable_reads(p: &Program) -> HashSet<(usize, usize)> {
-    if p.blocks.iter().any(|b| matches!(b.exit, crate::ir::Exit::Indirect)) {
-        return HashSet::new();
-    }
-    let is_read = |inst: &Inst| {
-        matches!(
-            &inst.fields,
-            Fields::Ds {
-                addr: Some(_),
-                data,
-                gds: false,
-                ..
-            } if inst.name().starts_with("ds_read") && data.is_empty()
-        )
-    };
-    let is_write = |inst: &Inst| {
-        matches!(inst.fields, Fields::Ds { gds: false, .. })
-            && !(inst.name().starts_with("ds_swizzle") || inst.name().contains("permute"))
-            && !is_read(inst)
-    };
-    let rpo = crate::ir::reverse_postorder(&p.blocks);
-    let mut pos = vec![usize::MAX; p.blocks.len()];
-    for (idx, &b) in rpo.iter().enumerate() {
-        pos[b] = idx;
-    }
-    let mut max_write: Option<(usize, usize)> = None;
-    for &b in &rpo {
-        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-            if is_write(inst) {
-                max_write = Some(max_write.map_or((pos[b], i), |m| m.max((pos[b], i))));
-            }
-        }
-    }
-    let mut dirty_in = vec![false; p.blocks.len()];
-    if max_write.is_some() {
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &b in &rpo {
-                let mut d = dirty_in[b];
-                for inst in &p.blocks[b].insts {
-                    if is_write(inst) {
-                        d = true;
-                    } else if inst.name() == "s_barrier" {
-                        d = false;
-                    }
-                }
-                if d {
-                    for succ in p.blocks[b].exit.successors() {
-                        if !dirty_in[succ] {
-                            dirty_in[succ] = true;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let back_over_write_from: Vec<usize> = match max_write {
-        Some((mw, _)) => rpo
-            .iter()
-            .copied()
-            .filter(|&from| {
-                p.blocks[from]
-                    .exit
-                    .successors()
-                    .into_iter()
-                    .any(|to| pos[to] <= pos[from] && pos[to] <= mw)
-            })
-            .map(|from| pos[from])
-            .collect(),
-        None => Vec::new(),
-    };
-    let mut out = HashSet::new();
-    for &b in &rpo {
-        let loops_over_write = back_over_write_from.iter().any(|&f| f >= pos[b]);
-        let mut d = dirty_in[b];
-        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-            if is_write(inst) {
-                d = true;
-            } else if inst.name() == "s_barrier" {
-                d = false;
-            } else if is_read(inst)
-                && !d
-                && !loops_over_write
-                && max_write.is_none_or(|mw| (pos[b], i) > mw)
-            {
-                out.insert((b, i));
-            }
-        }
-    }
-    out
-}
-
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
-    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let stable_lds = lds_stable_reads(p);
-    let mut same: HashSet<Value> = HashSet::new();
-    for b in crate::ir::reverse_postorder(&p.blocks) {
-        let block = &p.blocks[b];
-        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
-        for phi in &block.phis {
-            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
-                same.insert(phi.value);
-            }
-        }
-        for (i, inst) in block.insts.iter().enumerate() {
-            let name = inst.name();
-            let ops: Vec<Operand> = match &inst.fields {
-                Fields::Valu(v)
-                    if v.dpp.is_none()
-                        && v.sdwa.is_none()
-                        && !name.starts_with("v_mbcnt")
-                        && !name.starts_with("v_cmpx")
-                        && !name.contains("lane") =>
-                {
-                    v.src.clone()
-                }
-                Fields::Ds {
-                    addr: Some(a),
-                    data,
-                    gds: false,
-                    ..
-                } if name.starts_with("ds_read") && data.is_empty() && stable_lds.contains(&(b, i)) => {
-                    vec![*a]
-                }
-                _ => continue,
-            };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
-            if alike {
-                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
-            }
-        }
-    }
-    same
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1658,7 +1498,13 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    let threads = match x.native.io {
+                        StageIo::Cs(cs) => Some(cs.threads),
+                        _ => None,
+                    };
+                    lane_uniform(p, x.st, all, threads)
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -5869,10 +5715,19 @@ impl<'a> Lower<'a> {
                             .flat_map(|b| &b.phis)
                             .any(|p| p.args.contains(&v))
                 });
-            if count <= 4
-                && !reads_d2
-                && let Some((lo, hi)) = self.view_address(site)
-            {
+            let address_words = if count > 4 || reads_d2 {
+                None
+            } else if let Some(words) = self.view_address(site) {
+                Some(words)
+            } else if (0..count.min(2)).any(|k| {
+                inst.write(Reg::S(code + k as u8))
+                    .is_some_and(|v| self.computed_with(v, 6))
+            }) {
+                self.slot_address(site)?
+            } else {
+                None
+            };
+            if let Some((lo, hi)) = address_words {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
@@ -6016,11 +5871,14 @@ impl<'a> Lower<'a> {
                     inst.write(Reg::S(code + first + k))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
-                if first == 0
-                    && computed
-                    && let Some((lo, hi)) = self.view_address(site)
-                {
-                    words.extend([(0, lo), (1, hi)]);
+                if first == 0 && computed {
+                    let address_words = match self.view_address(site) {
+                        Some(words) => Some(words),
+                        None => self.slot_address(site)?,
+                    };
+                    if let Some((lo, hi)) = address_words {
+                        words.extend([(0, lo), (1, hi)]);
+                    }
                 }
                 words
             }
@@ -6565,6 +6423,48 @@ impl<'a> Lower<'a> {
         let v = self.as_int(f);
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// The title address (low, high dword) of the buffer view the scalar load
+    /// at `load` picks from the view heap at an index the program computes,
+    /// from the host's table by heap slot ([`super::shader::SLOT_ADDRESSES`]);
+    /// None if the load is not of that kind.
+    fn slot_address(&mut self, load: Site) -> Result<Option<(V, V)>, Why> {
+        let heap = self
+            .scalar
+            .get(&load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| p.root == RootType::ResourceHeap);
+        if !heap {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(load, 0, false)?;
+        // Inside the table whatever the index.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let first = self.s.m.i32(super::shader::SLOT_ADDRESSES * 4);
+        let byte = self.s.m.bin(c, Bin::Add, byte, first);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(3);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let lo = self.s.m.extract(c, r, 0);
+        let lo = self.as_int(lo);
+        let hi = self.s.m.extract(c, r, 1);
+        let hi = self.as_int(hi);
+        Ok(Some((lo, hi)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
