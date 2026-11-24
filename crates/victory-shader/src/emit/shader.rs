@@ -452,6 +452,7 @@ impl Shader {
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),

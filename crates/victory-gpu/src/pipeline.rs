@@ -258,9 +258,14 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// counters) and gets none, and a copy's pages are overwritten from title
 /// memory when the title writes them.
 #[cfg(windows)]
-pub(crate) fn builder_quarantined(this: This) -> bool {
+pub(crate) fn quarantine() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+pub(crate) fn builder_quarantined(this: This) -> bool {
+    is_builder(this) && quarantine()
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.

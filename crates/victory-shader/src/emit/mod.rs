@@ -498,13 +498,21 @@ fn emit_with_wave_retries(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
-                Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Ok((_, wave)) if lower::host_max_wave() > 32 || wave != Some(64) => again,
+                _ => emit_program(c, native, p, st, io, res),
             }
         }
         other => other,
     };
-    original.map(|(shader, _)| shader)
+    match original {
+        Ok((_, Some(64))) if native.stage == HwStage::Cs && lower::host_max_wave() == 32 => {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a 64-lane wave on a 32-lane host",
+            })
+        }
+        other => other.map(|(shader, _)| shader),
+    }
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

@@ -1518,3 +1518,358 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+#[test]
+fn dead_f64_wave_sum_clears_doubles_flag_and_validates() {
+    let s_or_saveexec_b32 =
+        |sdst: u8, src0: u8| 0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32;
+    let v_mov_dpp8 = |vdst: u8, vsrc: u8, sel: u32| [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)];
+    let v_mov_row_mirror = |vdst: u8, vsrc: u8| {
+        [
+            vop1(0x001, vdst, 0xFA),
+            vsrc as u32 | (0x140 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+        ]
+    };
+
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop1(0x001, 6, sgpr(0)));
+    words.push(vop1(0x001, 7, sgpr(1)));
+    words.push(s_or_saveexec_b32(12, 0xC1));
+    words.extend_from_slice(&vop3(0x101, 2, 0x80, vgpr(6), sgpr(12)));
+    words.extend_from_slice(&vop3(0x101, 3, 0x80, vgpr(7), sgpr(12)));
+    for sel in [14570689u32, 9658386, 2340] {
+        words.extend_from_slice(&v_mov_dpp8(4, 2, sel));
+        words.extend_from_slice(&v_mov_dpp8(5, 3, sel));
+        words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    }
+    words.extend_from_slice(&v_mov_row_mirror(4, 2));
+    words.extend_from_slice(&v_mov_row_mirror(5, 3));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.extend_from_slice(&vop3(0x378, 4, vgpr(2), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x378, 5, vgpr(3), 0x80, 0x80));
+    words.extend_from_slice(&vop3(0x164, 2, vgpr(4), vgpr(2), 0));
+    words.push(s_mov_b32(126, 12));
+    // Store s0 instead of the f64 sum so DCE eliminates all double ops.
+    words.push(vop1(0x001, 0, sgpr(0)));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [4, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed after dead f64 cleanup");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        host.compute_pipeline(&shader)
+            .expect("hardware compute_pipeline failed after dead f64 cleanup");
+    }
+}
+
+#[test]
+fn full_32k_lds_wave64_on_wave32_stays_within_tgsm_cap_and_unravels_2d_threads() {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // Thread (x=v0, y=v1) in [8, 8, 1] with full 32 KiB (8,192 dwords) LDS:
+    // flat = y * 8 + x; write flat + 100 to LDS[flat], barrier, read via v_readlane_b32 from lane 63.
+    words.push(0x3404_0283); // v_lshlrev_b32 v2, 3, v1
+    words.push(0x4A04_0500); // v_add_nc_u32 v2, v0, v2
+    words.push(0x3406_0482); // v_lshlrev_b32 v3, 2, v2 (byte addr)
+    words.push(0x4A08_04FF);
+    words.push(100); // v_add_nc_u32 v4, 100, v2
+    words.push(0xD834_0000);
+    words.push(0x0000_0403); // ds_write_b32 v3, v4
+    words.push(0xBF8A_0000); // s_barrier
+    words.push(0xD8D8_0000);
+    words.push(0x0500_0003); // ds_read_b32 v5, v3
+    words.extend_from_slice(&vop3(0x360, 14, vgpr(5), 0x80 + 63, 0)); // v_readlane_b32 s14, v5, 63
+    words.push(vop1(0x001, 6, sgpr(14)));
+    words.extend_from_slice(&buffer_store_dword(6, 8, 0));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            // 5 user SGPRs, 2 thread_id_vgprs (v0, v1 -> 1 << 11), 32 KiB LDS (64 << 15).
+            rsrc2: (5 << 1) | (1 << 11) | (64 << 15),
+            threads: [8, 8, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let c_bytes = {
+        // Build via emit_with_wave_retries using a minimal dummy container wrapper via lower_with_local_waves_any check:
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = lower::with_local_waves_any(|| {
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        lowered.expect("lower 32 KiB LDS wave64 on wave32")
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = c_bytes.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed on 32 KiB LDS shader");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: c_bytes.dxil,
+        user_data: c_bytes.user_data,
+        samplers: c_bytes.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: c_bytes.root_cbvs,
+        root_srvs: c_bytes.root_srvs,
+        root_uavs: c_bytes.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .expect("32 KiB LDS compute_pipeline must not fail with E_OUTOFMEMORY");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch 32 KiB LDS shader");
+        // Under local_waves_any, lane 63 maps to lane 31 of each half-wave (31 + 100 = 131 or 63 + 100 = 163).
+        assert!(out[0][0] == 131 || out[0][0] == 163, "unexpected output {}", out[0][0]);
+    }
+}
+
+#[test]
+fn v_writelane_writes_inactive_lane_regardless_of_exec() {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop1(0x001, 2, 0x80)); // v_mov_b32 v2, 0
+    // Mask off lane 3 (`v_cmpx_eq_u32 exec_lo, 0, v0`: only lane 0 active!)
+    words.push(0x7DA4_0080);
+    // While only lane 0 is in EXEC, park s0 into lane 3 of v2!
+    words.extend_from_slice(&vop3(0x361, 2, sgpr(0), 0x80 + 3, 0)); // v_writelane_b32 v2, s0, 3
+    // Restore all 4 lanes (`s_mov_b32 exec_lo, 0xf`) and read lane 3 back!
+    words.push(s_mov_b32(126, 0x80 + 15));
+    words.extend_from_slice(&vop3(0x360, 14, vgpr(2), 0x80 + 3, 0)); // v_readlane_b32 s14, v2, 3
+    words.push(vop1(0x001, 0, sgpr(14)));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [4, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = 0xCAFE_BABE;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], 0xCAFE_BABE);
+    }
+}
