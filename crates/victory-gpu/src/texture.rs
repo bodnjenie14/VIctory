@@ -66,6 +66,8 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame this texture's contents last changed after its initial load.
+    changed: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -651,10 +653,17 @@ impl Staging {
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
+            // A texture whose contents changed after initial load (e.g. Bink's
+            // multi-buffer YUV video ring written through an aliased view) is
+            // checked every frame while active so ring slots never show stale
+            // frames out of order. Static textures never enter the hot window.
+            const HOT_FRAMES: u64 = 64;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let frame = crate::frame::current();
+            let hot = last.changed.is_some_and(|at| frame.saturating_sub(at) < HOT_FRAMES);
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            if unwritten && !hot && !turn {
                 return 0;
             }
         }
@@ -696,6 +705,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
+                if last.hash.is_some() {
+                    last.changed = Some(frame);
+                }
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
@@ -718,6 +730,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                if last.hash.is_some() {
+                    last.changed = Some(crate::frame::current());
+                }
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -733,6 +748,9 @@ impl Staging {
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
+        }
+        if last.hash.is_some() {
+            last.changed = Some(crate::frame::current());
         }
         last.hash = Some(hash);
         self.detile(tiled);
@@ -755,6 +773,9 @@ impl Staging {
             }
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
+                if last.hash.is_some() {
+                    last.changed = Some(crate::frame::current());
+                }
                 last.hash = Some(hash);
                 self.detile(read);
             }
