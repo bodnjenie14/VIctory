@@ -236,6 +236,9 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// With `split_lds` under `local_any`: per IR block whether every lane runs it (`false`
+    /// emits a shared-memory fence without group sync so divergent LDS blocks never hang).
+    lds_fence_all: Option<Vec<bool>>,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1245,6 +1248,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
+        let mut lds_fence_all: Option<Vec<bool>> = None;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
@@ -1262,6 +1266,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -1332,6 +1337,22 @@ impl<'a> Lower<'a> {
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
+                        }
+                    }
+                    if wave == 64 && LOCAL_ANY.get() {
+                        // Last-resort Wave32 fallback on a 32-lane host: never leave `WaveSize(64)`
+                        // (which D3D12 rejects with E_INVALIDARG). Non-uniform LDS blocks get a
+                        // shared-memory fence without group sync so they cannot deadlock.
+                        let all_blocks =
+                            all_lane_blocks(x.st).unwrap_or_else(|| vec![false; p.blocks.len()]);
+                        wave = 32;
+                        split_lds = s.lds_dwords > 0 && group > 32;
+                        if split_lds {
+                            lds_fence_all = Some(all_blocks.clone());
+                        }
+                        if crosses {
+                            exchange = Some((s.lds_dwords, group <= 32, all_blocks));
+                            s.lds_dwords += 2 * group.div_ceil(64);
                         }
                     }
                 }
@@ -1502,6 +1523,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_fence_all,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -1993,7 +2015,7 @@ impl<'a> Lower<'a> {
             .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
         let mut r_lo = self.s.m.extract(c, split, 0);
         let mut r_hi = self.s.m.extract(c, split, 1);
-        if self.exchange.is_some() {
+        if !self.local && self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
@@ -3025,7 +3047,7 @@ impl<'a> Lower<'a> {
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole {
+        if !self.x.st.active.contains(&lo) && !whole && !self.local_any {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -3704,7 +3726,7 @@ impl<'a> Lower<'a> {
         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
@@ -4696,7 +4718,11 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
+            let mut m = meeting_mode();
+            if self.lds_fence_all.as_ref().is_some_and(|all| !all.get(b).copied().unwrap_or(false)) {
+                m &= !1;
+            }
+            let mode = self.s.m.i32(m);
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
@@ -5600,8 +5626,60 @@ impl<'a> Lower<'a> {
                 .filter(|(s, b)| *s != site && *b == a && same(*s))
                 .find_map(|(s, _)| use_of(*s))
         };
-        let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        let use_at = use_of(site).or_else(twin).or_else(|| self.same_entry_use(site));
+        let (src, first, used, uav, props, image) = if let Some((at, first)) = use_at {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let uav = un.contains("store")
+                || un.contains("atomic")
+                || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match &ui.fields {
+                // A ray-tracing structure in a buffer of the host: read raw.
+                Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
+                Fields::Image { dim, .. } => {
+                    let kind = match dim {
+                        0 => 1,
+                        1 => 2,
+                        2 => 4,
+                        4 => 6,
+                        5 => 7,
+                        _ => return Err("an image dimension (cube or MSAA)"),
+                    };
+                    ((kind | u, 0x409), Some(kind))
+                }
+                Fields::Buffer { idxen, format, .. } => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let props = if un.starts_with("buffer_load_format")
+                        || un.starts_with("buffer_store_format")
+                    {
+                        (10 | u, 0x409)
+                    } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        self.stale.extend(inst.writes.iter().map(|w| w.1));
+                        return Err("a constant buffer's descriptor read as data");
+                    }
+                    (props, None)
+                }
+                // Read by scalar buffer loads alone: the raw view `smem` reads it through.
+                Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+                    ((11, 0), None)
+                }
+                // A constant buffer: nothing of its descriptor is a number.
+                Fields::Smem { .. } => {
+                    self.stale.extend(inst.writes.iter().map(|w| w.1));
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                _ => return Err("a scalar memory read as data"),
+            };
+            (src, first, used, uav, props, image)
+        } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5649,57 +5727,22 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+            let src = Source::Loaded { load: site, first: 0 };
+            let used = self.used_kind(&src);
+            if let Some(uk) = used
+                && matches!(uk.kind, ResourceType::Srv | ResourceType::Uav)
+            {
+                let uav = uk.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = if count >= 8 || uk.dwords == 8 {
+                    ((2 | u, 0x409), Some(2))
                 } else {
-                    (11 | u, 0)
+                    ((11 | u, 0), None)
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    self.stale.extend(inst.writes.iter().map(|w| w.1));
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
+                (src, 0u8, used, uav, props, image)
+            } else {
+                return Err("a descriptor read only as data");
             }
-            // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
-                ((11, 0), None)
-            }
-            // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
-                self.stale.extend(inst.writes.iter().map(|w| w.1));
-                return Err("a constant buffer's descriptor read as data");
-            }
-            _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -5790,6 +5833,47 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The use site and first dword of a resource descriptor loaded from
+    /// the same heap entry as the scalar load at `site`.
+    fn same_entry_use(&self, site: Site) -> Option<(Site, u8)> {
+        let a = self.scalar.get(&site)?;
+        let lane = |v: Value| -> Value {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+                .filter(|i| i.name() == "v_readfirstlane_b32")
+                .and_then(|i| i.reads.iter().find(|r| matches!(r.0, Reg::V(_))))
+                .map_or(v, |r| r.1)
+        };
+        let same = |b: &Address| {
+            b.param == a.param
+                && b.offset == a.offset
+                && match (a.dynamic, b.dynamic) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => x == y || lane(x) == lane(y),
+                    _ => false,
+                }
+        };
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+            .find_map(|d| {
+                d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first }
+                        if load != site && self.scalar.get(&load).is_some_and(same) =>
+                    {
+                        Some((d.site, first))
+                    }
+                    _ => None,
+                })
+            })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7331,6 +7415,74 @@ impl<'a> Lower<'a> {
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k15, k7, k8, k2, k16, not15) = (
+                    k(self, 15),
+                    k(self, 7),
+                    k(self, 8),
+                    k(self, 2),
+                    k(self, 16),
+                    k(self, !15),
+                );
+                let row_pos = self.s.m.bin(c, Bin::And, lane, k15);
+                let in_hi = self.s.m.cmp(c, pred::IUGE, row_pos, k8);
+                let sel_word = self.s.m.select(c, in_hi, s2, s1);
+                let nib = self.s.m.bin(c, Bin::And, row_pos, k7);
+                let sh = self.s.m.bin(c, Bin::Shl, nib, k2);
+                let shifted = self.s.m.bin(c, Bin::LShr, sel_word, sh);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let mut base = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    base = self.s.m.bin(c, Bin::Xor, base, k16);
+                }
+                let src_lane = self.s.m.bin(c, Bin::Or, base, pick);
+                let gathered = self.read_lane(a, src_lane);
+                let fi = v.opsel & 1 != 0;
+                let bound_ctrl = v.opsel & 2 != 0;
+                if fi {
+                    return int(self, gathered);
+                }
+                let zero = k(self, 0);
+                let one = k(self, 1);
+                let k31 = k(self, 31);
+                let within_half = self.s.m.bin(c, Bin::And, src_lane, k31);
+                let active = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let ty = self
+                    .s
+                    .m
+                    .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+                let ballot = self
+                    .s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, ty, 116, &[active]);
+                self.s.flags |= flags::WAVE_OPS;
+                let lo = self.s.m.extract(c, ballot, 0);
+                let hi = self.s.m.extract(c, ballot, 1);
+                let not31 = k(self, !31);
+                let half_base = self.s.m.bin(c, Bin::And, lane, not31);
+                let is_lo = self.s.m.cmp(c, pred::EQ, half_base, zero);
+                let bits = self.s.m.select(c, is_lo, lo, hi);
+                let bsh = self.s.m.bin(c, Bin::LShr, bits, within_half);
+                let bit = self.s.m.bin(c, Bin::And, bsh, one);
+                let src_active = self.s.m.cmp(c, pred::NE, bit, zero);
+                if bound_ctrl {
+                    let r = self.s.m.select(c, src_active, gathered, zero);
+                    int(self, r)
+                } else {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("a permlane result");
+                    };
+                    let old = match inst.read(Reg::V(reg)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => zero,
+                    };
+                    let r = self.s.m.select(c, src_active, gathered, old);
+                    int(self, r)
+                }
             }
             "v_readfirstlane_b32"
                 if inst
@@ -10342,7 +10494,10 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // Two f16 channels per source dword: only the pixel color and
+        // depth targets unpack them, and only into an output element the
+        // host declares a 32-bit float; the rest stay refused.
+        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -10474,7 +10629,11 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                let half = e.compressed.then_some(ch % 2 == 1);
+                if half.is_some() && outputs[id].comp != 9 {
+                    return Err("a compressed export");
+                }
+                stores.push((id, col, value, half));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
