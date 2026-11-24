@@ -546,6 +546,36 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
+        let mut g_clean = GraphicsState {
+            blend: g.blend,
+            sample_mask: g.sample_mask,
+            rasterizer: g.rasterizer,
+            depth: g.depth,
+            inputs: Vec::new(),
+            names: Vec::new(),
+            strip_cut: g.strip_cut,
+            topology: g.topology,
+            targets: g.targets,
+            depth_format: g.depth_format,
+            samples: g.samples,
+        };
+        if g_clean.depth_format == DXGI_FORMAT_UNKNOWN {
+            g_clean.depth.DepthEnable = false.into();
+            g_clean.depth.StencilEnable = false.into();
+        }
+        for i in 0..8 {
+            let fmt = if (i as u32) < g_clean.targets.NumRenderTargets {
+                g_clean.targets.RTFormats[i]
+            } else {
+                DXGI_FORMAT_UNKNOWN
+            };
+            if fmt == DXGI_FORMAT_UNKNOWN {
+                g_clean.blend.RenderTarget[i].BlendEnable = false.into();
+                g_clean.blend.RenderTarget[i].LogicOpEnable = false.into();
+            } else if is_integer_rt_format(fmt) {
+                g_clean.blend.RenderTarget[i].BlendEnable = false.into();
+            }
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -557,7 +587,7 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), &g_clean, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -605,10 +635,10 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
-            SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
+            BlendState: g_clean.blend,
+            SampleMask: g_clean.sample_mask,
+            RasterizerState: g_clean.rasterizer,
+            DepthStencilState: g_clean.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
                 NumElements: g.inputs.len() as u32,
@@ -784,6 +814,33 @@ fn mesh_pipeline(
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
+    )
+}
+
+fn is_integer_rt_format(fmt: DXGI_FORMAT) -> bool {
+    matches!(
+        fmt,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
     )
 }
 

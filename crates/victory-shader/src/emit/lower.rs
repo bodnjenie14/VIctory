@@ -5850,8 +5850,27 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // from the host, the other dwords have no value. If dword 2
+            // (record count) is read, fall through to `getDimensions`, which
+            // supplies both dword 2 and `view_address` when needed.
+            let reads_d2 = count >= 3
+                && inst.write(Reg::S(code + 2)).is_some_and(|v| {
+                    self.x
+                        .p
+                        .blocks
+                        .iter()
+                        .flat_map(|b| b.insts.iter().flat_map(|i| &i.reads))
+                        .any(|r| r.1 == v)
+                        || self
+                            .x
+                            .p
+                            .blocks
+                            .iter()
+                            .flat_map(|b| &b.phis)
+                            .any(|p| p.args.contains(&v))
+                });
             if count <= 4
+                && !reads_d2
                 && let Some((lo, hi)) = self.view_address(site)
             {
                 for k in 0..count {
@@ -9114,6 +9133,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            self.stale.extend(inst.writes.iter().map(|w| w.1));
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
@@ -11049,14 +11069,31 @@ impl<'a> Lower<'a> {
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 if back(self, taken) && back(self, not_taken) {
-                    let ok_t = self.count_iteration(taken, pred::IULT);
-                    let ok_f = self.count_iteration(not_taken, pred::IULT);
-                    let go = self.s.m.select(self.cur, cond, ok_t, ok_f);
-                    let abort = self.abort_block();
-                    let split = self.s.m.new_block();
-                    let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                    self.s.m.terminate(split, Term::CondBr(cond, t, f));
-                    Term::CondBr(go, split, abort)
+                    if taken == not_taken {
+                        let ok = self.count_iteration(taken, pred::IULT);
+                        let abort = self.abort_block();
+                        Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                    } else {
+                        let ok_t = self.count_iteration(taken, pred::IULT);
+                        let ok_f = self.count_iteration(not_taken, pred::IULT);
+                        let head = self.cur;
+                        let go = self.s.m.select(head, cond, ok_t, ok_f);
+                        let abort = self.abort_block();
+                        let split = self.s.m.new_block();
+                        self.s.m.terminate(head, Term::CondBr(go, split, abort));
+                        for hdr in [taken, not_taken] {
+                            if let Some((_, inc)) = self.counters.get_mut(&hdr)
+                                && let Some(last) = inc.last_mut()
+                                && last.1 == head
+                            {
+                                last.1 = split;
+                            }
+                        }
+                        self.cur = split;
+                        self.tail[b] = Some(split);
+                        let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                        Term::CondBr(cond, t, f)
+                    }
                 } else {
                     // (No `xor` of a compare: a loop exit testing one hung the
                     // AMD driver.)

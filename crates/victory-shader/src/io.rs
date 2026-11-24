@@ -369,6 +369,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut p1_sites: Vec<(Site, Attribute, Option<Value>)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +383,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => {
+                            p1_sites.push((site, attribute, inst.writes.first().map(|w| w.1)));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +405,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        p1_sites.push((site, attribute, inst.writes.first().map(|w| w.1)));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -457,6 +463,66 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     });
                 }
                 _ => {}
+            }
+        }
+    }
+    // A first half (`v_interp_p1_*`) whose result is also read outside `v_interp_p2_*`
+    // evaluates on its own (`P0 + i * P10`), and any paired `p2` reading it becomes
+    // `Interp::Weighted` (`acc + j * P20`) so both halves hold exact values.
+    let read_outside_p2 = |start: Value| {
+        let mut stack = vec![start];
+        let mut seen = std::collections::HashSet::from([start]);
+        while let Some(v) = stack.pop() {
+            if io.exports.iter().any(|e| e.values.contains(&Some(v))) {
+                return true;
+            }
+            for block in &p.blocks {
+                for inst in &block.insts {
+                    if inst.reads.iter().any(|r| r.1 == v)
+                        && !matches!(inst.name(), "v_interp_p2_f32" | "v_interp_p2_f16")
+                    {
+                        return true;
+                    }
+                }
+                for phi in &block.phis {
+                    if phi.args.contains(&v) && seen.insert(phi.value) {
+                        stack.push(phi.value);
+                    }
+                }
+            }
+        }
+        false
+    };
+    for (s, attribute, written) in p1_sites {
+        if io.interps.iter().any(|(is, _)| *is == s) {
+            continue;
+        }
+        if !written.is_some_and(read_outside_p2) {
+            continue;
+        }
+        let mut extra_first = vec![s];
+        for (_, interp) in &mut io.interps {
+            if let Interp::Interpolated {
+                attribute: a,
+                first,
+                ..
+            } = interp
+                && first.contains(&s)
+            {
+                let attr_copy = *a;
+                for &f in first.iter() {
+                    if !extra_first.contains(&f) {
+                        extra_first.push(f);
+                    }
+                }
+                *interp = Interp::Weighted {
+                    attribute: attr_copy,
+                };
+            }
+        }
+        for f in extra_first {
+            if !io.interps.iter().any(|(is, _)| *is == f) {
+                io.interps.push((f, Interp::Weighted { attribute }));
             }
         }
     }
