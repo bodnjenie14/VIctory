@@ -19,6 +19,9 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 
 use crate::{HleModule, hle_export};
 
+mod window_size;
+pub use window_size::use_window_size_file;
+
 type Routine = extern "system" fn(quiesced: u8, context: *mut c_void);
 
 /// Registration id, routine and context of each suspend routine.
@@ -81,6 +84,7 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    window_size::install(hwnd);
     hwnd
 }
 
@@ -107,6 +111,7 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    window_size::install(hwnd);
     hwnd
 }
 
@@ -181,6 +186,9 @@ extern "system" fn window_proc(
     // VI aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
+        return 0;
+    }
+    if window_size::handle_message(hwnd, message, wparam) {
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.

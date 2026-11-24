@@ -467,7 +467,7 @@ fn emit_with_wave_retries(
                 }
             }
         }
-        if local_on && (!exact_only || !wide_on) {
+        if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
                 for (name, f) in &forms {

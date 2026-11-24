@@ -55,6 +55,9 @@ pub fn run(
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
+    victory_hle::modules::lifecycle::use_window_size_file(
+        storage.with_file_name("victory-window-size.txt"),
+    );
     println!(
         "title          {:08X}, storage {} ({} MB)",
         title.id,

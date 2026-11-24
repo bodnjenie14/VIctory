@@ -1424,7 +1424,11 @@ impl<'a> Lower<'a> {
                 .exits
                 .iter()
                 .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+                .any(|(b, e)| match *e {
+                    LaneExit::Jump(t) => back(b, t),
+                    LaneExit::Branch { taken, not_taken, .. } => back(b, taken) && back(b, not_taken),
+                    _ => false,
+                });
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -3047,7 +3051,7 @@ impl<'a> Lower<'a> {
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
-        if !self.x.st.active.contains(&lo) && !whole && !self.local_any {
+        if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -10854,32 +10858,43 @@ impl<'a> Lower<'a> {
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-                // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                if back(self, taken) && back(self, not_taken) {
+                    let ok_t = self.count_iteration(taken, pred::IULT);
+                    let ok_f = self.count_iteration(not_taken, pred::IULT);
+                    let go = self.s.m.select(self.cur, cond, ok_t, ok_f);
+                    let abort = self.abort_block();
+                    let split = self.s.m.new_block();
+                    let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                    self.s.m.terminate(split, Term::CondBr(cond, t, f));
+                    Term::CondBr(go, split, abort)
                 } else {
-                    cond
-                };
-                // Critical edges get a block of their own, so loops have
-                // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
-                        };
-                        self.enter_loop(b, to, from);
+                    // (No `xor` of a compare: a loop exit testing one hung the
+                    // AMD driver.)
+                    let cond = if back(self, taken) {
+                        let ok = self.count_iteration(taken, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else if back(self, not_taken) {
+                        let stop = self.count_iteration(not_taken, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    } else {
+                        cond
+                    };
+                    // Critical edges get a block of their own, so loops have
+                    // dedicated exits and preheaders as DXC emits them.
+                    let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                    for (to, via) in [(taken, t), (not_taken, f)] {
+                        if !back(self, to) {
+                            // From an edge block, or from here.
+                            let from = if Some(via) == self.block[to] {
+                                self.cur
+                            } else {
+                                via
+                            };
+                            self.enter_loop(b, to, from);
+                        }
                     }
+                    Term::CondBr(cond, t, f)
                 }
-                Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
