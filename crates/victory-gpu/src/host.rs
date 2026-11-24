@@ -6334,11 +6334,15 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        let mut style = WS_OVERLAPPEDWINDOW;
+        if std::env::var_os("VICTORY_HEADLESS").is_none_or(|value| value != "1") {
+            style |= WS_VISIBLE;
+        }
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             rect.right - rect.left,

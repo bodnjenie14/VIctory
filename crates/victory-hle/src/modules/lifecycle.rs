@@ -77,6 +77,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let style = capture_style(parent, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -104,6 +105,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let style = capture_style(parent, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -113,6 +115,14 @@ pub extern "system" fn CreateWindowExA(
     hook(hwnd);
     window_size::install(hwnd);
     hwnd
+}
+
+fn capture_style(parent: HWND, style: u32) -> u32 {
+    if parent.is_null() && std::env::var_os("VICTORY_HEADLESS").is_some_and(|value| value == "1") {
+        style & !wm::WS_VISIBLE
+    } else {
+        style
+    }
 }
 
 /// A console title sizes its window to its render target (
