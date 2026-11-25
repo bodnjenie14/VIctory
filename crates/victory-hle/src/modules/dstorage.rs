@@ -14,8 +14,14 @@
 //! in order: a status entry is written once every request enqueued before
 //! it on its queue has finished, with the first failure (in queue order)
 //! since the previous status entry, or success.
+//! `VICTORY_NATIVE_DIRECTSTORAGE=1` uses Windows DirectStorage for file
+//! reads when the Microsoft runtime is installed beside the executable.
+//! `VICTORY_NVCOMP_ZLIB=1` tries CUDA on previously validated file chunks.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+mod native;
+mod nvcomp;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -144,7 +150,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let native = native::open(&file);
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, native });
     put(out, file)
 }
 
@@ -258,6 +265,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    native: Option<native::File>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -832,7 +840,14 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => {
+            let result = if options & MEMORY_SOURCE == 0 {
+                nvcomp::inflate_file(&source, out)
+            } else {
+                inflate(&source, out)
+            };
+            result.map_err(|hr| fail(hr, "zlib"))
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -847,11 +862,28 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    inflate_with_consumption(source, out).map(|(_, written)| written)
+}
+
+fn inflate_with_consumption(source: &[u8], out: &mut [u8]) -> Result<(usize, usize), HRESULT> {
+    use miniz_oxide::inflate::TINFLStatus;
+    use miniz_oxide::inflate::core::inflate_flags::{
+        TINFL_FLAG_PARSE_ZLIB_HEADER, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    };
+    use miniz_oxide::inflate::core::{DecompressorOxide, decompress};
+
+    let (status, consumed, written) = decompress(
+        &mut DecompressorOxide::new(),
+        source,
+        out,
+        0,
+        TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+    if status == TINFLStatus::Done {
+        return Ok((consumed, written));
+    }
+    tracing::debug!(?status, "dstorage: zlib stream");
+    Err(INVALID_DATA)
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -919,16 +951,18 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
+    if file.native.as_ref().is_some_and(|native| native.read(request.offset, out)) {
+        READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        return Ok(());
+    }
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1182,6 +1216,32 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU, nvCOMP 5.3 CUDA 13 DLLs and VICTORY_NVCOMP_ZLIB=1"]
+    fn nvcomp_decodes_a_previously_validated_file_request() {
+        let plain = pattern(64 << 10);
+        let mut packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let exact = packed.len();
+        packed.push(0xa5);
+        let (_dir, file) = file_with(&packed);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut inflated = vec![0; plain.len()];
+        let before = nvcomp::gpu_decodes();
+        for (source_size, expected_gpu_decodes) in [(exact + 1, 0), (exact + 1, 0), (exact, 0), (exact, 1)] {
+            inflated.fill(0);
+            enqueue(queue, &request(ZLIB, inflated.as_mut_ptr().cast(), plain.len(), file, 0, source_size));
+            enqueue_status(queue, array, 0);
+            void(queue, 0x30);
+            assert_eq!(wait(array, 0), S_OK);
+            assert_eq!(inflated, plain);
+            assert_eq!(nvcomp::gpu_decodes(), before + expected_gpu_decodes);
+        }
+        void(queue, 0x40);
+        release(queue.cast::<Instance<Queue>>());
+        release(array.cast::<Instance<StatusArray>>());
+        release(file.cast::<Instance<File>>());
     }
 
     #[test]

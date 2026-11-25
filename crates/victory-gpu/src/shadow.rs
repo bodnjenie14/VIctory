@@ -164,6 +164,23 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// Keep large title buffers in CPU-visible, GPU-writable memory for the
+/// relay. The CPU can merge shader writes after their submission fence,
+/// without sending another list to fetch them from VRAM. Smaller buffers
+/// keep their usual placement. Disabled unless a positive MiB threshold
+/// is set in VICTORY_SHARED_BUFFERS_MIN_MB.
+fn prefer_shared_buffer(size: u64) -> bool {
+    static MINIMUM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let minimum = MINIMUM.get_or_init(|| {
+        std::env::var("VICTORY_SHARED_BUFFERS_MIN_MB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .and_then(|mb| mb.checked_mul(1 << 20))
+    });
+    minimum.is_some_and(|minimum| size >= minimum)
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -2875,7 +2892,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card, alias_heap) = match card_for(size) {
+        let shared = big && prefer_shared_buffer(size);
+        if shared {
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "large title buffer uses shared CPU/GPU memory"
+            );
+        }
+        let card_buffer = if shared { None } else { card_for(size) };
+        let (buffer, card, alias_heap) = match card_buffer {
             Some((on_card, card_heap)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

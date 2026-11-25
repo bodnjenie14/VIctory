@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION as WorkingSetEntry;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -877,6 +878,28 @@ fn by_query() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
 }
 
+const KERNEL_PAGE: usize = 4096;
+
+fn query_working_set(entries: &mut [WorkingSetEntry]) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: entries point to a writable array of the size given; the
+    // addresses in them are queried in our own process.
+    (unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            entries.as_mut_ptr().cast(),
+            size_of_val(entries) as u32,
+        )
+    }) != 0
+}
+
+fn page_present(entry: &WorkingSetEntry, queried: bool) -> bool {
+    // SAFETY: the flags are plain data in the working-set query result.
+    let resident = queried && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+    resident || crate::host::read_into(entry.VirtualAddress.cast(), &mut [0])
+}
+
 /// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
 /// can be read, and how many there are; with `all`, it stops at the first
 /// that cannot. One question to the kernel for up to 256 pages at once
@@ -886,34 +909,20 @@ fn by_query() -> bool {
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
     let mut there = 0;
     // SAFETY: plain data.
-    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut info: [WorkingSetEntry; 256] = unsafe { std::mem::zeroed() };
     let mut page = first;
     while page <= last {
         let n = (last - page + 1).min(info.len());
         for (i, entry) in info[..n].iter_mut().enumerate() {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
-        for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+        let asked = query_working_set(&mut info[..n]);
+        for entry in &info[..n] {
+            if page_present(entry, asked) {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -922,6 +931,33 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// Count the same 64 KiB blocks as the scalar path while asking Windows
+/// about up to 256 first pages at once. See ezbyDev/victory-amd 98335f7c94.
+fn mapped_blocks(start: usize, end: usize) -> u64 {
+    const BLOCK: usize = 64 << 10;
+    // SAFETY: plain data, filled in by the query.
+    let mut entries: [WorkingSetEntry; 256] = unsafe { std::mem::zeroed() };
+    let mut block = start & !(BLOCK - 1);
+    let mut there = 0;
+    while block < end {
+        let first = block;
+        let mut count = 0;
+        while block < end && count < entries.len() {
+            entries[count].VirtualAddress = (block.max(start) & !(KERNEL_PAGE - 1)) as *mut _;
+            count += 1;
+            block = block.saturating_add(BLOCK);
+        }
+        let queried = query_working_set(&mut entries[..count]);
+        for (i, entry) in entries[..count].iter().enumerate() {
+            if page_present(entry, queried) {
+                let at = first + i * BLOCK;
+                there += (at.saturating_add(BLOCK).min(end) - at.max(start)) as u64;
+            }
+        }
+    }
+    there
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -963,6 +999,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
+        }
+        static MAPPED_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MAPPED_BATCH.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BATCH").is_some_and(|v| v == "1")) {
+            return mapped_blocks(start, end);
         }
         // By 64 KiB block, one page asked of each: the title's memory is
         // mapped in blocks of that size (the console's page), and the
@@ -1078,7 +1118,28 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{mapped_blocks, with_title};
+
+    #[test]
+    fn batched_mapping_counts_only_readable_partial_blocks() {
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const LAST: usize = 257 * BLOCK;
+        // SAFETY: these operations touch only the test's own reservation.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), LAST + BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(3 * BLOCK);
+            let last = base.add(LAST);
+            for address in [base, middle, last] {
+                assert_eq!(VirtualAlloc(address.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), address.cast());
+            }
+            middle.write(1);
+            let bytes = mapped_blocks(base.add(37) as usize, last.add(111) as usize);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            assert_eq!(bytes, (2 * BLOCK - 37 + 111) as u64);
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
