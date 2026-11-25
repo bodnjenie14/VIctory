@@ -117,7 +117,9 @@ const WINDOW_MOST: u64 = 64;
 /// apart after it (16, then twice as many each time, [`WINDOW_MOST`] at
 /// most, never past the buffer) into
 /// the list's scratch buffer in one pass, and the draws that follow read
-/// their record there with no pass of ours, until one of these: a compute
+/// their record there with no pass of ours and no barrier (the scratch
+/// buffer stays readable as arguments until the next clamp), until one of
+/// these: a compute
 /// dispatch, a direct draw, an indirect call with a count buffer or more
 /// than one record, a draw whose shaders can store to buffers, a record
 /// outside the window, another host list.
@@ -1067,6 +1069,10 @@ impl State {
                     return false;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            if compute {
+                self.note_cull_output(list, &stage.shader.hash, &made);
+            }
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -1293,23 +1299,44 @@ impl State {
             .find(|h| !h.samplers())?;
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        static SUBMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let submit_refresh = *SUBMIT.get_or_init(|| {
+            if !std::env::var_os("VICTORY_HEAP_REFRESH_SUBMIT").is_some_and(|v| v == "1") {
+                return false;
+            }
+            let enabled = every == 1 && !crate::host::late();
+            tracing::info!(enabled, "heap buffer refresh at first consuming submission");
+            enabled
+        });
         // One key per list, as textures have: no title resource is there.
         const ONCE: usize = usize::MAX - 0x5e;
-        if !list.first_use(ONCE) {
+        let first = if submit_refresh {
+            list.first_heap_use(gpu)
+        } else {
+            list.first_use(ONCE)
+        };
+        if !first {
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
-        // The pass itself once per frame: per list it ran up to 51 times a
+        // The scan itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
-        // shortcut: what the title writes into such buffers between lists
-        // of one frame is seen a frame late.
+        // The submit trial lets every consumer name the same spans. Writes
+        // after the first consuming submission can still be seen a frame late.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        if !submit_refresh && FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1320,13 +1347,28 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        #[derive(Default)]
+        struct HeapBufferCache {
+            passes: u64,
+            ranges: Ranges,
+            refresh: Option<(u64, std::sync::Arc<crate::host::HeapRefresh>)>,
+        }
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapBufferCache>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let HeapBufferCache { passes, ranges, refresh } = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_default();
+        if submit_refresh
+            && let Some((recorded, refresh)) = refresh
+            && *recorded == frame
+        {
+            let refresh = refresh.clone();
+            drop(kept);
+            list.defer_heap_refresh(refresh);
+            return Some(gpu);
+        }
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
             ranges.clear();
@@ -1383,6 +1425,17 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
+        let deferred = submit_refresh.then(|| {
+            let spans = spans
+                .values()
+                .map(|(shadow, from, to)| {
+                    (shadow.clone(), *from as usize, (to - from).min(shadow.left(*from)) as usize)
+                })
+                .collect();
+            let shared = std::sync::Arc::new(crate::host::HeapRefresh::new(spans));
+            *refresh = Some((frame, shared.clone()));
+            shared
+        });
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
@@ -1392,30 +1445,27 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
+        if let Some(deferred) = deferred {
+            list.defer_heap_refresh(deferred);
+        } else {
+            static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+                std::sync::Mutex::new(None);
+            let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+            let whole = whole.get_or_insert_with(Default::default);
+            for (shadow, from, to) in spans.values() {
+                if shadow.unwatched() {
+                    // By the copy's number: a copy made where one let go was
+                    // (`shadow::let_go_idle`) has never been refreshed.
+                    let key = shadow.id() as usize;
+                    match whole.get(&key) {
+                        Some(&last) if frame < last + every => continue,
+                        _ => {
+                            whole.insert(key, frame);
+                        }
                     }
                 }
+                shadow.refresh(list, *from, to - from);
             }
-            shadow.refresh(list, *from, to - from);
         }
         self.heap_textures(list, heap, host);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
@@ -1727,10 +1777,46 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_draw(|detailed| self.op_text(format!("dispatch {x}x{y}x{z}"), true, detailed));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Identifies the host buffer already bound to a cull producer's output.
+    #[cfg(feature = "diagnostics")]
+    fn note_cull_output(&self, list: &HostList, shader: &str, fresh: &[(u8, u32)]) {
+        let Some(offset) = crate::indirect::cull_probe_uav_offset(shader) else {
+            return;
+        };
+        let Some(frame) = crate::indirect::probe_frame() else {
+            return;
+        };
+        let Some(Root::Table(table)) = self.compute.first() else {
+            return;
+        };
+        let handle = table + u64::from(offset) * 4;
+        let Some(heap) = self.heap_of(handle) else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let slot = match fresh.iter().find(|(root, _)| *root == 0) {
+            Some((_, base)) => Some(base / 32 + offset / 8),
+            None => heap.index(handle).filter(|slot| *slot < host.count()),
+        };
+        let title = crate::descriptor::view(handle)
+            .as_ref()
+            .and_then(crate::descriptor::host::buffer_range);
+        let output_copy_base = slot.and_then(|slot| host.buffer_slot_gpu(slot));
+        let list_id = std::ptr::from_ref(list) as usize;
+        tracing::info!(
+            frame, list = format_args!("{list_id:#x}"), shader, offset_dwords = offset,
+            ?slot, title = format_args!("{title:#x?}"),
+            output_copy_base = format_args!("{output_copy_base:#x?}"),
+            "cull indirect output binding"
+        );
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1738,12 +1824,15 @@ impl State {
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
-    fn op_text(&self, kind: String, compute: bool) -> String {
+    fn op_text(&self, kind: String, compute: bool, detailed: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        if !detailed {
+            return text;
+        }
         // What it draws into (a dispatch writes through its views below).
         if !compute {
             let described = |t: usize| {
@@ -1825,7 +1914,7 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_draw(|detailed| self.op_text(format!("mesh {x}"), false, detailed));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
@@ -2155,7 +2244,7 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.note_draw(|detailed| self.op_text(format!("draw {count}x{instances}"), false, detailed));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2256,7 +2345,7 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.note_draw(|detailed| self.op_text(format!("indexed {indices}x{instances}"), false, detailed));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2452,14 +2541,24 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
             why("prepare failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+        list.note_draw(|detailed| {
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+                detailed,
+            )
         });
+        #[cfg(feature = "diagnostics")]
+        if matches!(kind, MESH | DISPATCH) && max == 1 && !windowed {
+            let count = counter
+                .as_ref()
+                .map(|(shadow, address)| (&shadow.buffer, shadow.offset(*address)));
+            crate::indirect::probe_group_args(list, p, kind, (&args, arguments), &bounded, count);
+        }
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
@@ -2478,7 +2577,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // The scratch buffer stays readable as arguments: the next draw of
+        // the window reads it with no barrier, and the next clamp moves it
+        // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

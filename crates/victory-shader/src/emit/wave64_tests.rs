@@ -450,3 +450,216 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Lowers a wave64 compute program in dual-lane `(V_lo, V_hi)` wave32 mode and validates DXIL.
+fn lowered_dual(native: &NativeProgram, p: &ir::Program) -> HostShader {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::with_dual_lane(|| {
+        lower::lower(&lower::Parts {
+            native,
+            p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("dual-lane lower");
+    assert_eq!(lowered.wave_size, Some(32));
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Runs `shader` on the hardware device with `s0` and returns `dwords` of the raw UAV.
+fn on_the_card_uav(shader: &HostShader, s0: u32, dwords: u32) -> Option<Vec<u32>> {
+    let host = Host::new(false).expect("a hardware device with shader model 6.6 is available");
+    let (root, pso) = host.compute_pipeline(shader).expect("the hardware accepts the dual-lane program");
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+            ud[u.index as usize] = s0;
+        }
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    Some(out[0].clone())
+}
+
+/// Dual-lane wave64-in-wave32: divergent LDS write + cross-half LDS read inside `if (v0 < s0)`.
+/// Each active lane writes `v0 + 100` to `lds[v0]`, reads `lds[v0 ^ 32]`, and stores to `uav[v0]`.
+#[test]
+fn dual_lane_divergent_lds_read_write() {
+    let words = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0          (v4 = v0 * 4)
+        0x3A0A_00A0, // v_xor_b32 v5, 32, v0             (v5 = v0 ^ 32)
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5          (v5 = (v0 ^ 32) * 4)
+        0x4A02_00FF,
+        100,         // v_add_nc_u32 v1, 100, v0         (v1 = v0 + 100)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0         (vcc = v0 < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0006, // s_cbranch_execz +6 dwords (past ds_write, ds_read, buffer_store)
+        0xD834_0000,
+        (1 << 8) | 4, // ds_write_b32 v4, v1
+        0xD8D8_0000,
+        (2 << 24) | 5, // ds_read_b32 v2, v5
+        0xE070_1000,
+        (0x80 << 24) | (2 << 16) | (2 << 8) | 4, // buffer_store_dword v2, v4, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let mut prog = native(&words);
+    if let StageIo::Cs(ref mut cs) = prog.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes LDS
+    }
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered_dual(&prog, &p);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(out64) = on_the_card_uav(&shader, 64, 64) else { return };
+    for t in 0..64u32 {
+        assert_eq!(out64[t as usize], (t ^ 32) + 100, "s0=64 lane {t}");
+    }
+    let Some(out40) = on_the_card_uav(&shader, 40, 64) else { return };
+    for t in 0..64u32 {
+        if t < 40 {
+            let peer = t ^ 32;
+            if peer < 40 {
+                assert_eq!(out40[t as usize], peer + 100, "s0=40 lane {t} (peer {peer} active)");
+            }
+        } else {
+            assert_eq!(out40[t as usize], 0, "s0=40 inactive lane {t} must not write");
+        }
+    }
+    eprintln!("ran on the hardware device: dual-lane divergent LDS R/W verified across 64 lanes");
+}
+
+/// Dual-lane wave64-in-wave32: `v_mbcnt_lo/hi` and `s_bcnt1_i32_b64` (mask-as-data) inside a
+/// divergent branch `if (v0 < s0)`. Active lanes count even active lanes (`s7`) and their
+/// prefix rank (`v2`), storing `(s7 << 16) | v2` to `uav[v0]`.
+#[test]
+fn dual_lane_mbcnt_and_mask_as_data_in_divergent_branch() {
+    let words = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0          (v4 = v0 * 4)
+        0x3602_0081, // v_and_b32 v1, 1, v0              (v1 = v0 & 1)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0         (vcc = v0 < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz +10 dwords (to restore)
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1          (vcc = active even lanes)
+        0xBE87_106A, // s_bcnt1_i32_b64 s7, vcc          (s7 = count of active even lanes)
+        0xD765_0002,
+        (0x80 << 9) | 0x6A, // v_mbcnt_lo_u32_b32 v2, vcc_lo, 0
+        0xD766_0002,
+        (258 << 9) | 0x6B, // v_mbcnt_hi_u32_b32 v2, vcc_hi, v2
+        0x8F06_9007, // s_lshl_b32 s6, s7, 16            (SOP2 op 0x1E: 0x8F00_0000 | (6<<16) | (0x90<<8) | 7)
+        0x3806_0406, // v_or_b32 v3, s6, v2              (VOP2 op 0x1C: 0x3800_0000 | (3<<17) | (2<<9) | 6)
+        0xE070_1000,
+        (0x80 << 24) | (2 << 16) | (3 << 8) | 4, // buffer_store_dword v3, v4, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let prog = native(&words);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered_dual(&prog, &p);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(out) = on_the_card_uav(&shader, 50, 64) else { return };
+    for t in 0..64u32 {
+        let expected = if t < 50 { (25 << 16) | ((t + 1) / 2) } else { 0 };
+        assert_eq!(out[t as usize], expected, "s0=50 lane {t}");
+    }
+    eprintln!("ran on the hardware device: dual-lane v_mbcnt + mask-as-data in divergent branch verified");
+}
+
+/// Dual-lane wave64-in-wave32: cross-half `ds_bpermute_b32` and `v_readlane_b32`.
+/// Each lane computes `v1 = v0 + 1000`, permutes `v2 = lane[v0 ^ 32].v1`, reads scalar
+/// `s7 = lane[s0].v1`, and stores `(s7 << 16) | v2` to `uav[v0]`.
+#[test]
+fn dual_lane_cross_half_bpermute_and_readlane() {
+    let words = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0          (v4 = v0 * 4)
+        0x3A0A_00A0, // v_xor_b32 v5, 32, v0             (v5 = v0 ^ 32)
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5          (v5 = (v0 ^ 32) * 4)
+        0x4A02_00FF,
+        1000,        // v_add_nc_u32 v1, 1000, v0        (v1 = v0 + 1000)
+        0xDACC_0000,
+        (2 << 24) | (1 << 8) | 5, // ds_bpermute_b32 v2, v5, v1
+        0xD760_0007,
+        (0 << 9) | 257, // v_readlane_b32 s7, v1, s0
+        0x8F06_9007, // s_lshl_b32 s6, s7, 16
+        0x3806_0406, // v_or_b32 v3, s6, v2
+        0xE070_1000,
+        (0x80 << 24) | (2 << 16) | (3 << 8) | 4, // buffer_store_dword v3, v4, s[8:11], 0 offen
+    ];
+    let prog = native(&words);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered_dual(&prog, &p);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for target in [5u32, 45u32] {
+        let Some(out) = on_the_card_uav(&shader, target, 64) else { return };
+        for t in 0..64u32 {
+            let expected = ((target + 1000) << 16) | ((t ^ 32) + 1000);
+            assert_eq!(out[t as usize], expected, "readlane target={target} lane {t}");
+        }
+    }
+    eprintln!("ran on the hardware device: dual-lane cross-half ds_bpermute_b32 + v_readlane_b32 verified");
+}
+
+/// Dual-lane wave64-in-wave32: DPP16 with `row_mask:0xc` (`row_shr:1`, `bank_mask:0xf`,
+/// `bound_ctrl:0`). Only rows 2 and 3 (console lanes 32..63, excluding row-boundary lanes
+/// 32 and 48) take the DPP result; lanes 0..31 keep their old value.
+#[test]
+fn dual_lane_dpp_row_mask() {
+    let words = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0          (v4 = v0 * 4)
+        0x4A02_00FF,
+        1000,        // v_add_nc_u32 v1, 1000, v0        (v1 = v0 + 1000)
+        0x4A04_0081, // v_add_nc_u32 v2, 1, v0           (v2 = v0 + 1)
+        0x4A02_02FA,
+        0xCF01_1102, // v_add_nc_u32_dpp v1, v2, v1 row_shr:1 row_mask:0xc bank_mask:0xf
+        0xE070_1000,
+        (0x80 << 24) | (2 << 16) | (1 << 8) | 4, // buffer_store_dword v1, v4, s[8:11], 0 offen
+    ];
+    let prog = native(&words);
+    let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+    let shader = lowered_dual(&prog, &p);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(out) = on_the_card_uav(&shader, 0, 64) else { return };
+    for t in 0..64u32 {
+        let old = t + 1000;
+        let expected = if t >= 32 && (t & 15) >= 1 {
+            // row_shr:1 reads v2[t - 1] = t, added to v1[t] = t + 1000
+            t + old
+        } else {
+            old
+        };
+        assert_eq!(out[t as usize], expected, "dpp row_mask:0xc lane {t}");
+    }
+    eprintln!("ran on the hardware device: dual-lane DPP row_mask:0xc verified across 64 lanes");
+}

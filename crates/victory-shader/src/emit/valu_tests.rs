@@ -1266,6 +1266,23 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
+fn v_add_f64_writes_both_result_words() {
+    let args = [(1.0f64, f64::EPSILON), (-3.75, 0.25), (1e200, -1e200)];
+    let inputs = args.map(|(a, b)| {
+        let (a, b) = (a.to_bits(), b.to_bits());
+        [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+    });
+    for word in 0..2 {
+        let [lo, hi] = vop3(0x164, 5, vgpr(1), vgpr(3), 0);
+        let shader = build_valu_cs(&[lo, hi, vop1(0x001, 0, vgpr(5 + word))]);
+        run_cases_on(&shader, &inputs, &[("warp", true)], |_, i, _, got| {
+            let (a, b) = args[i];
+            assert_eq!(got, ((a + b).to_bits() >> (32 * word)) as u32);
+        });
+    }
+}
+
+#[test]
 fn v_cvt_f32_f64_matches_ieee754() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
     let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
@@ -1871,5 +1888,131 @@ fn v_writelane_writes_inactive_lane_regardless_of_exec() {
             )
             .expect("dispatch");
         assert_eq!(out[0][0], 0xCAFE_BABE);
+    }
+}
+
+/// Verifies `lds_stable_reads` + `v_readfirstlane_b32` under partial EXEC on
+/// the real GPU: all 64 threads write `tid + 1` to LDS, hit `s_barrier`, then
+/// under a partial-lane mask read a uniform LDS address (`ds_read_b32`) and
+/// broadcast it via `v_readfirstlane_b32` to accumulate a prefix sum.
+#[test]
+fn lds_stable_read_readfirstlane_prefix_sum_on_gpu() {
+    const DS_READ_B32: u8 = 0x36;
+    let mut words = Vec::new();
+    // s4 = descriptor table base -> s_load_dwordx4 s[8:11], s[4:5], 0
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // v1 = tid * 4 (LDS byte address), v2 = tid + 1 (value written to LDS)
+    words.push(vop2(0x1A, 1, 0x80 + 2, 0)); // v_lshlrev_b32 v1, 2, v0
+    words.push(vop2(0x25, 2, 0x80 + 1, 0)); // v_add_nc_u32 v2, 1, v0
+    words.extend_from_slice(&ds(DS_WRITE_B32, 0, 1, 2)); // ds_write_b32 v1, v2
+    words.push(S_BARRIER);
+    // Uniform LDS read of element 7 (byte offset 28 -> value 8) and element 31 (byte offset 124 -> value 32)
+    // under a partial-lane mask (only even lanes active: (tid & 1) == 0).
+    words.push(vop2(0x1B, 3, 0x80 + 1, 0)); // v_and_b32 v3, 1, v0
+    words.push(0x7DA4_0680); // v_cmpx_eq_u32 exec, 0, v3 (only even lanes active!)
+    // Read uniform LDS addr = 28 (value = 8)
+    words.push(vop1(0x001, 4, 0x80 + 28)); // v_mov_b32 v4, 28
+    words.extend_from_slice(&ds(DS_READ_B32, 5, 4, 0)); // ds_read_b32 v5, v4
+    words.push(vop1(0x002, 12, vgpr(5))); // v_readfirstlane_b32 s12, v5
+    // Read uniform LDS addr = 124 (value = 32)
+    words.push(vop1(0x001, 4, 0xFF)); // v_mov_b32 v4, 124
+    words.push(124);
+    words.extend_from_slice(&ds(DS_READ_B32, 6, 4, 0)); // ds_read_b32 v6, v4
+    words.push(vop1(0x002, 13, vgpr(6))); // v_readfirstlane_b32 s13, v6
+    // v7 = s12 + s13 + tid = 8 + 32 + tid = 40 + tid (for even lanes)
+    words.push(vop2(0x25, 7, sgpr(12), 0)); // v_add_nc_u32 v7, s12, v0
+    words.push(vop2(0x25, 7, sgpr(13), 7)); // v_add_nc_u32 v7, s13, v7
+    // Store v7 at byte offset tid * 4 (v1, offen=1)
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | (1 << 12),
+        0x80 << 24 | ((8u32 >> 2) & 0x1F) << 16 | (7u32 << 8) | 1u32,
+    ]);
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (5 << 1) | (2 << 15), // 256 bytes of LDS
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    let lowered = lowered.expect("lower lds_stable_reads + v_readfirstlane");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = lowered.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(host) = Host::new(false) {
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        for tid in 0..64u32 {
+            let want = if tid % 2 == 0 { 40 + tid } else { 0 };
+            assert_eq!(out[0][tid as usize], want, "tid={tid}");
+        }
     }
 }

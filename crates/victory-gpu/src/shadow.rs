@@ -77,7 +77,16 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Explicit heap backing `buffer` at offset [`ALIAS_PAD`] (128 KiB), so
+    /// 12-byte typed SRVs (`R32G32B32_*`) at `offset % 12 == 4` or `8` can
+    /// lazily place a live alias at offset `0` (+128 KiB, `≡ 8 mod 12`) or
+    /// `64 KiB` (+64 KiB, `≡ 4 mod 12`) with zero copies.
+    alias_heap: Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
+    aliases: Mutex<[Option<ID3D12Resource>; 2]>,
 }
+
+/// Leading heap padding (2 × 64 KiB) for live 12-byte placed buffer aliases.
+const ALIAS_PAD: u64 = 128 << 10;
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
@@ -190,7 +199,7 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Option<(ID3D12Resource, Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>)> {
     if !cards() {
         return None;
     }
@@ -217,11 +226,17 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
+    let made = if size >= 64 << 10 {
+        host.uav_buffer_heap(size, ALIAS_PAD)
+            .map(|(heap, buf)| (buf, Some(heap)))
+            .or_else(|| host.uav_buffer(size).map(|buf| (buf, None)))
+    } else {
+        host.uav_buffer(size).map(|buf| (buf, None))
+    };
+    if made.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    made
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -254,7 +269,7 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+fn window_card_for(size: u64) -> Option<(ID3D12Resource, Option<windows::Win32::Graphics::Direct3D12::ID3D12Heap>)> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -272,11 +287,17 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
+    let made = if size >= 64 << 10 {
+        host.uav_buffer_heap(size, ALIAS_PAD)
+            .map(|(heap, buf)| (buf, Some(heap)))
+            .or_else(|| host.uav_buffer(size).map(|buf| (buf, None)))
+    } else {
+        host.uav_buffer(size).map(|buf| (buf, None))
+    };
+    if made.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    made
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
@@ -1720,7 +1741,58 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            alias_heap: None,
+            aliases: Mutex::new([None, None]),
         }
+    }
+
+    /// Returns a live placed buffer alias of `self.buffer` shifted earlier in
+    /// `self.alias_heap` so that `offset` becomes an exact multiple of 12
+    /// bytes (for `R32G32B32_*` typed SRVs at `offset % 12 == 4` or `8`).
+    pub(crate) fn aligned_12(&self, offset: u64) -> Option<(ID3D12Resource, u64)> {
+        if offset >= self.len || !offset.is_multiple_of(4) || offset.is_multiple_of(12) {
+            return None;
+        }
+        let heap = self.alias_heap.as_ref()?;
+        let (slot, shift): (usize, u64) = if offset % 12 == 4 {
+            (0, 128 << 10) // 131072 % 12 == 8 -> (4 + 8) % 12 == 0
+        } else {
+            (1, 64 << 10) // 65536 % 12 == 4 -> (8 + 4) % 12 == 0
+        };
+        let mut aliases = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = &aliases[slot] {
+            return Some((existing.clone(), offset + shift));
+        }
+        let host = host()?;
+        // SAFETY: live resource.
+        let mut desc = unsafe { self.buffer.GetDesc() };
+        desc.Width = desc.Width.checked_add(shift)?;
+        let mut alias: Option<ID3D12Resource> = None;
+        // SAFETY: `alias_heap` has `ALIAS_PAD` bytes before `self.buffer`.
+        let ok = unsafe {
+            host.device.CreatePlacedResource(
+                heap,
+                ALIAS_PAD - shift,
+                &desc,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut alias,
+            )
+        };
+        if ok.is_err() {
+            return None;
+        }
+        let alias = alias?;
+        aliases[slot] = Some(alias.clone());
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let views = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if views.is_power_of_two() {
+                tracing::info!(views, residue = offset % 12, "live 12-byte buffer aliases created");
+            }
+        }
+        Some((alias, offset + shift))
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2789,12 +2861,22 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let (buffer, data, shared_heap) = if size >= 64 << 10 {
+            if let Some((heap, buf, ptr)) = host()?.shared_buffer_heap(size, ALIAS_PAD) {
+                (buf, ptr, Some(heap))
+            } else {
+                let (buf, ptr) = host()?.shared_buffer(size)?;
+                (buf, ptr, None)
+            }
+        } else {
+            let (buf, ptr) = host()?.shared_buffer(size)?;
+            (buf, ptr, None)
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        let (buffer, card, alias_heap) = match card_for(size) {
+            Some((on_card, card_heap)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -2808,9 +2890,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, Some(card), card_heap)
             }
-            None => (buffer, None),
+            None => (buffer, None, shared_heap),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2829,6 +2911,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.alias_heap = alias_heap;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3010,12 +3093,22 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data, shared_heap) = if len >= 64 << 10 {
+        if let Some((heap, buf, ptr)) = host()?.shared_buffer_heap(len, ALIAS_PAD) {
+            (buf, ptr, Some(heap))
+        } else {
+            let (buf, ptr) = host()?.shared_buffer(len)?;
+            (buf, ptr, None)
+        }
+    } else {
+        let (buf, ptr) = host()?.shared_buffer(len)?;
+        (buf, ptr, None)
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
+    let (buffer, card, alias_heap) = match window_card_for(len) {
+        Some((on_card, card_heap)) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
@@ -3024,9 +3117,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 size: len,
             };
-            (on_card, Some(card))
+            (on_card, Some(card), card_heap)
         }
-        None => (buffer, None),
+        None => (buffer, None, shared_heap),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3038,6 +3131,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.alias_heap = alias_heap;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));

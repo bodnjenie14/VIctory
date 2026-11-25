@@ -573,6 +573,17 @@ fn emit_with_wave_retries(
                 }
             }
         }
+        // Final fallback for Wave64 compute shaders that cannot lower to single-lane
+        // Wave32 (e.g. divergent LDS R/W, MASK_ELSEWHERE, v_mbcnt + mask as data):
+        // exact dual-lane (V_lo, V_hi) wave64-in-wave32 with zero cross-wave barriers.
+        let dual_on = std::env::var_os("VICTORY_WAVE_DUAL").is_none_or(|v| v != "0");
+        if dual_on {
+            let again = lower::with_dual_lane(|| emit_program(c, native, p, st, io, res));
+            report("dual-lane wave64-in-wave32", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

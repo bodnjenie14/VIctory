@@ -59,6 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// Changed pages of a placed shader-visible heap. Some titles copy
+    /// descriptor records into it as bytes, without a descriptor API call.
+    #[cfg(windows)]
+    written: Option<crate::watch::Tracked>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -153,6 +157,120 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// Mirrors records copied directly into placed shader-visible heaps. Calls
+/// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
+/// only write-watch pages to reveal which slots changed.
+#[cfg(windows)]
+pub(crate) fn sync_heaps() {
+    if raw_heap_mirror_enabled() {
+        sync_watched_heaps();
+    }
+}
+
+fn raw_heap_mirror_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(all(windows, feature = "diagnostics"))
+            && std::env::var_os("VICTORY_MIRROR_RAW_HEAPS").is_some_and(|v| v == "1")
+    })
+}
+
+#[cfg(windows)]
+fn sync_watched_heaps() {
+    #[cfg(feature = "diagnostics")]
+    let (frame, trace) = {
+        let frame = crate::queue::presented() + 1;
+        (frame, crate::capture::listed(frame))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let (frame, trace) = (0_u64, false);
+    let (mut checked, mut mismatched, mut remirrored, mut unreadable) = (0, 0, 0, 0);
+    let mut sample = None;
+    let mut page_bytes = [0; crate::watch::PAGE];
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        let step = u64::from(step);
+        // Capped host heaps have no counterparts for the title slots reserved
+        // for per-draw tables; raw writes there must not be mirrored.
+        let mirrored_count = heap.desc.count.min(host.count());
+        for (range_from, range_end) in written.take(start as usize, end as usize) {
+            let mut page = range_from & !(crate::watch::PAGE - 1);
+            while page < range_end {
+                let from = page.max(range_from);
+                let to = (page + crate::watch::PAGE).min(range_end);
+                page += crate::watch::PAGE;
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                if slots.is_empty() {
+                    continue;
+                }
+                let bytes = &mut page_bytes[..to - from];
+                // A readable first word is insufficient if a later part of
+                // the watched page was unmapped. Mirror only a readable snapshot.
+                if !crate::host::read_into(from as *const u8, bytes) {
+                    unreadable += 1;
+                    continue;
+                }
+                for index in slots {
+                    let handle = start + index * step;
+                    let mut header = [0; 12];
+                    let in_page = (handle as usize)
+                        .checked_sub(from)
+                        .and_then(|offset| bytes.get(offset..offset + header.len()));
+                    if let Some(in_page) = in_page {
+                        header.copy_from_slice(in_page);
+                    } else if !crate::host::read_into(handle as *const u8, &mut header) {
+                        continue;
+                    }
+                    let words = std::array::from_fn(|i| {
+                        u32::from_le_bytes(header[i * 4..i * 4 + 4].try_into().unwrap())
+                    });
+                    let [title, before, after] = host.mirror_raw(index as u32, handle, words);
+                    if trace {
+                        checked += 1;
+                        mismatched += u64::from(title != before);
+                        remirrored += u64::from(after != before);
+                        if after != before && sample.is_none() {
+                            sample = Some((start, index, title, before, after));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(heaps);
+    if trace && (checked > 0 || unreadable > 0) {
+        tracing::info!(
+            frame, checked, mismatched, remirrored, unreadable,
+            sample = ?sample,
+            "raw descriptor heap sync (sample: heap, slot, title key, previous host key, new host key)"
+        );
+    }
+}
+
+/// Title descriptor slots in a changed byte range that have host counterparts.
+/// `range_end` is exclusive.
+#[cfg(windows)]
+fn changed_slots(
+    range_from: usize,
+    range_end: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> std::ops::Range<u64> {
+    let from = (range_from - heap_start) as u64;
+    let to = (range_end - heap_start) as u64;
+    let first = from / step;
+    let last = to.div_ceil(step).min(u64::from(mirrored_count));
+    first.min(last)..last
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -911,6 +1029,15 @@ pub(crate) extern "system" fn create_heap(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    create_heap_inner(desc_ptr, iid, out, raw_heap_mirror_enabled())
+}
+
+fn create_heap_inner(
+    desc_ptr: *const HeapDesc,
+    iid: *const Iid,
+    out: *mut This,
+    #[cfg_attr(not(windows), allow(unused_variables))] track_placed: bool,
+) -> HRESULT {
     // SAFETY: the title passes a description (null is tolerated).
     let Some(&desc) = (unsafe { desc_ptr.as_ref() }) else {
         return E_INVALIDARG;
@@ -937,6 +1064,14 @@ pub(crate) extern "system" fn create_heap(
         }
     };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    #[cfg(windows)]
+    let written = (placed && visible && track_placed)
+        .then(|| crate::watch::track(start as usize, size as usize, true))
+        .flatten();
+    #[cfg(windows)]
+    if placed && visible && track_placed {
+        tracing::info!(heap = start, slots = desc.count, tracked = written.is_some(), "placed descriptor heap raw tracking");
+    }
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
@@ -946,6 +1081,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        written,
     });
     #[cfg(windows)]
     if visible {
@@ -1003,6 +1140,34 @@ mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn raw_heap_sync_stops_before_dynamic_host_slots() {
+        let start = 0x1000usize;
+        let step = 32;
+        let capped = 5;
+        assert_eq!(
+            changed_slots(
+                start + 3 * step + 4,
+                start + 4 * step + 8,
+                start,
+                step as u64,
+                capped
+            ),
+            3..5
+        );
+        assert_eq!(
+            changed_slots(
+                start + 6 * step,
+                start + 9 * step,
+                start,
+                step as u64,
+                capped
+            ),
+            5..5
+        );
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -1027,6 +1192,59 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    /// A descriptor copied into a placed heap as bytes is mirrored before
+    /// the next submission, even though no descriptor method saw the copy.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        let mut h: This = std::ptr::null();
+        let extended = Extended(desc, placement);
+        assert_eq!(create_heap_inner(&extended.0, &HEAP_IIDS[0], &mut h, true), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            // SAFETY: the heap slot and source both hold 16 descriptor bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source as *const u8,
+                    memory.cast::<u8>().add(5 * 16),
+                    16,
+                )
+            };
+            assert!(!host.made(5));
+            sync_watched_heaps();
+            assert!(host.made(5));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
     #[test]

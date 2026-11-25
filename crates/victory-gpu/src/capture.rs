@@ -51,9 +51,9 @@ pub(crate) fn listed(n: u64) -> bool {
     named || on_demand || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
-// A file named `now` in the capture folder: the next three frames are
-// captured (and the file removed), to catch a view on demand.
-fn on_demand(n: u64) -> bool {
+/// A file named `now` in the capture folder: the next three frames are
+/// captured (and the file removed), to catch a view on demand.
+pub(crate) fn on_demand(n: u64) -> bool {
     static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     use std::sync::atomic::Ordering::Relaxed;
@@ -133,8 +133,12 @@ const RING_LINES: usize = 6000;
 
 /// Whether `VICTORY_CAPTURE_WORLD` is set.
 fn world_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
+    world_capture_mode().is_some()
+}
+
+fn world_capture_mode() -> Option<&'static std::ffi::OsStr> {
+    static MODE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD")).as_deref()
 }
 
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
@@ -161,14 +165,17 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
+    // In benchmarks, keep the numbered offsets and manual capture marker,
+    // without forcing regular presents to wait for a readback.
+    let timeline = world_capture_mode().is_some_and(|mode| mode != "milestones");
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    let before_world = timeline && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = timeline && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
