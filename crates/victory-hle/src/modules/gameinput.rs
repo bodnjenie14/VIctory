@@ -1227,10 +1227,58 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|(hold, _)| hold.contains(&now))
             .map(|(_, vk)| *vk)
-            .collect()
+            .collect();
+        if let Some(play) = &*PLAY_SCRIPT {
+            play.lock().unwrap_or_else(|e| e.into_inner()).keys(now, &mut down);
+        }
+        down
+    }
+
+    /// A second schedule can be timed from a marker created after the
+    /// playable scene comes up, instead of from the first input poll.
+    #[cfg(feature = "diagnostics")]
+    static PLAY_SCRIPT: LazyLock<Option<std::sync::Mutex<PlayScript>>> = LazyLock::new(|| {
+        let marker = std::env::var_os("VICTORY_PLAY_INPUT_MARKER")?.into();
+        let keys = parse_script(&std::env::var("VICTORY_PLAY_KEYS").ok()?);
+        (!keys.is_empty()).then(|| {
+            std::sync::Mutex::new(PlayScript {
+                marker,
+                keys,
+                started: None,
+                next_check: Duration::ZERO,
+            })
+        })
+    });
+
+    #[cfg(feature = "diagnostics")]
+    struct PlayScript {
+        marker: std::path::PathBuf,
+        keys: Vec<ScriptedKey>,
+        started: Option<Duration>,
+        next_check: Duration,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl PlayScript {
+        fn keys(&mut self, elapsed: Duration, down: &mut Vec<u8>) {
+            if self.started.is_none() && elapsed >= self.next_check {
+                self.next_check = elapsed.saturating_add(Duration::from_millis(200));
+                if self.marker.is_file() {
+                    self.started = Some(elapsed);
+                    tracing::info!("headless gameplay input started");
+                }
+            }
+            if let Some(started) = self.started {
+                let now = elapsed - started;
+                down.extend(self.keys.iter().filter_map(|(hold, vk)| {
+                    hold.contains(&now).then_some(*vk)
+                }));
+            }
+        }
     }
 
     #[cfg(feature = "diagnostics")]
@@ -1288,6 +1336,30 @@ mod host {
         assert_eq!(pad.left_y, 1.0);
         assert_eq!(pad.right_x, 0.5);
         assert_ne!(pad.buttons & A, 0);
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn a_marker_starts_the_second_input_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("input");
+        let mut script = PlayScript {
+            marker: marker.clone(),
+            keys: parse_script("1:J:2"),
+            started: None,
+            next_check: Duration::ZERO,
+        };
+        let mut down = Vec::new();
+        script.keys(Duration::from_secs(100), &mut down);
+        assert!(down.is_empty());
+        std::fs::write(marker, []).unwrap();
+        script.keys(Duration::from_secs(101), &mut down);
+        assert!(down.is_empty());
+        script.keys(Duration::from_secs(102), &mut down);
+        assert_eq!(down, [b'J']);
+        down.clear();
+        script.keys(Duration::from_secs(104), &mut down);
+        assert!(down.is_empty());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
