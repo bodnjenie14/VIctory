@@ -586,18 +586,6 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
-/// A runtime write through a private view of physical pages completed.
-/// Already-mapped title aliases changed without faulting on their guards.
-pub fn title_memory_written(section: usize, offset: u64, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let _reading = title_memory_reading();
-    for (at, len) in crate::inplace::views_of_section(section, offset, len) {
-        writing(at, len);
-    }
-}
-
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -766,66 +754,6 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-    }
-
-    #[test]
-    fn completed_physical_write_invalidates_watched_aliases() {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
-        };
-
-        // A private writer maps part of a section shared by two title views,
-        // as the DirectStorage physical write and page window paths do.
-        // SAFETY: a pagefile section of our own.
-        let section = unsafe {
-            CreateFileMappingW(
-                -1isize as _,
-                std::ptr::null(),
-                PAGE_READWRITE,
-                0,
-                (3 * BLOCK) as u32,
-                std::ptr::null(),
-            )
-        };
-        assert!(!section.is_null());
-        let map = |offset, len| {
-            // SAFETY: a block-aligned range in the live section.
-            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, offset, len) };
-            assert!(!view.Value.is_null());
-            view
-        };
-        let a = map(0, 2 * BLOCK);
-        let b = map(BLOCK as u32, 2 * BLOCK);
-        let writer = map(BLOCK as u32, BLOCK);
-        let a_at = a.Value as usize;
-        let b_at = b.Value as usize;
-        crate::title_memory_view(a_at, 2 * BLOCK, section as usize, 0);
-        crate::title_memory_view(b_at, 2 * BLOCK, section as usize, BLOCK as u64);
-        assert!(guard(a_at, a_at + 2 * BLOCK).is_some());
-        assert!(guard(b_at, b_at + 2 * BLOCK).is_some());
-
-        const BYTE: usize = 31;
-        // SAFETY: the private view is writable and only this thread owns it.
-        unsafe { writer.Value.cast::<u8>().add(BYTE).write(0x5a) };
-        assert_eq!(guard(a_at, a_at + 2 * BLOCK), Some(vec![]));
-        assert_eq!(guard(b_at, b_at + 2 * BLOCK), Some(vec![]));
-        title_memory_written(section as usize, (BLOCK + BYTE) as u64, 1);
-        assert_eq!(guard(a_at, a_at + 2 * BLOCK), Some(vec![(a_at + BLOCK) / PAGE]));
-        assert_eq!(guard(b_at, b_at + 2 * BLOCK), Some(vec![b_at / PAGE]));
-        // SAFETY: the notified aliases show the committed page just written.
-        assert_eq!(unsafe { a.Value.cast::<u8>().add(BLOCK + BYTE).read() }, 0x5a);
-        assert_eq!(unsafe { b.Value.cast::<u8>().add(BYTE).read() }, 0x5a);
-
-        title_memory_remapped(a_at, 2 * BLOCK);
-        title_memory_remapped(b_at, 2 * BLOCK);
-        // SAFETY: the test owns the three views and the section.
-        unsafe {
-            UnmapViewOfFile(writer);
-            UnmapViewOfFile(b);
-            UnmapViewOfFile(a);
-            CloseHandle(section);
-        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
