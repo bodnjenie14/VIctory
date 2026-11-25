@@ -116,8 +116,12 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
+    keyboard_pad(|vk| keys.iter().any(|k| k.virtual_key == vk))
+}
+
+fn keyboard_pad(down: impl Fn(u8) -> bool) -> PadState {
     let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+        if down(vk) {
             1.0
         } else {
             0.0
@@ -1146,17 +1150,11 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
+            // A connected pad takes the place of the stand-in, so apply
+            // the diagnostic keys to that pad's report too.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                apply_scripted_pad(&mut pad, &scripted());
             }
             Some(pad)
         }
@@ -1198,16 +1196,60 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+    #[cfg(feature = "diagnostics")]
+    fn apply_scripted_pad(pad: &mut PadState, keys: &[u8]) {
+        let input = super::keyboard_pad(|vk| keys.contains(&vk));
+        pad.buttons |= input.buttons;
+        for (axis, requested) in [
+            (&mut pad.left_trigger, input.left_trigger),
+            (&mut pad.right_trigger, input.right_trigger),
+            (&mut pad.left_x, input.left_x),
+            (&mut pad.left_y, input.left_y),
+            (&mut pad.right_x, input.right_x),
+            (&mut pad.right_y, input.right_y),
+        ] {
+            if requested != 0.0 {
+                *axis = requested;
+            }
+        }
+    }
+
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold-seconds>],...`
+    /// holds each key after input starts, with or without focus. The
+    /// default hold is 0.2 seconds. A key is a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<ScriptedKey>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
+            (Instant::now(), parse_script(&list))
+        });
+        let (start, keys) = &*SCRIPT;
+        let now = start.elapsed();
+        keys.iter()
+            .filter(|(hold, _)| hold.contains(&now))
+            .map(|(_, vk)| *vk)
+            .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    type ScriptedKey = (std::ops::Range<Duration>, u8);
+
+    #[cfg(feature = "diagnostics")]
+    fn parse_script(list: &str) -> Vec<ScriptedKey> {
+        list.split(',')
+            .filter_map(|entry| {
+                let mut parts = entry.split(':');
+                let at = Duration::try_from_secs_f64(parts.next()?.trim().parse().ok()?).ok()?;
+                let key = parts.next()?;
+                let hold = match parts.next() {
+                    Some(seconds) => Duration::try_from_secs_f64(seconds.trim().parse().ok()?).ok()?,
+                    None => Duration::from_millis(200),
+                };
+                if hold.is_zero() || parts.next().is_some() {
+                    return None;
+                }
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1222,19 +1264,30 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+                Some((at..at.checked_add(hold)?, vk))
+            })
             .collect()
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    #[test]
+    fn scripted_keys_hold_axes_on_a_connected_pad() {
+        let keys = parse_script("10:W:3,10:Enter,11:S:0,12:A:-1,12:D:2:extra");
+        assert_eq!(
+            keys,
+            [
+                (Duration::from_secs(10)..Duration::from_secs(13), b'W'),
+                (Duration::from_secs(10)..Duration::from_millis(10_200), 0x0d),
+            ]
+        );
+        let mut pad = PadState {
+            right_x: 0.5,
+            ..PadState::default()
+        };
+        apply_scripted_pad(&mut pad, &[b'W', 0x0d]);
+        assert_eq!(pad.left_y, 1.0);
+        assert_eq!(pad.right_x, 0.5);
+        assert_ne!(pad.buttons & A, 0);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
