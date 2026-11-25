@@ -269,9 +269,71 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Per-container diagnostics for the wave64 retries.
+#[derive(Clone, Copy, Default)]
+pub struct ProgramOptions<'a> {
+    hash: &'a str,
+    exclude_deep_skips: bool,
+}
+
+impl<'a> ProgramOptions<'a> {
+    /// Uses the 16-digit container hash printed by the runtime and CLI.
+    /// In a diagnostics build, hashes in `VICTORY_WAVE_DEEP_SKIPS_NOT`
+    /// skip the deep retry even when it is enabled globally.
+    pub fn for_hash(hash: &'a str) -> Self {
+        #[cfg(feature = "diagnostics")]
+        let exclude_deep_skips = {
+            // Per-program experiment from fxceless/victory-fork#62 and VIcky e27b969.
+            static EXCLUDED: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+            let excluded = EXCLUDED.get_or_init(|| {
+                wave_hashes(&std::env::var("VICTORY_WAVE_DEEP_SKIPS_NOT").unwrap_or_default())
+            });
+            !excluded.is_empty()
+                && wave_hash(hash).is_some_and(|hash| excluded.contains(&hash))
+                && deep_skips_enabled()
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let exclude_deep_skips = false;
+        Self {
+            hash,
+            exclude_deep_skips,
+        }
+    }
+
+    /// Whether the per-program selection changes the global retry setting.
+    pub fn excludes_deep_skips(self) -> bool {
+        self.exclude_deep_skips
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn wave_hash(hash: &str) -> Option<u64> {
+    if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hash, 16).ok()
+}
+
+#[cfg(feature = "diagnostics")]
+fn wave_hashes(list: &str) -> Vec<u64> {
+    list.split(',').filter_map(|s| wave_hash(s.trim())).collect()
+}
+
+fn deep_skips_enabled() -> bool {
+    std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0")
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_options(container, ProgramOptions::default())
+}
+
+/// Translates a console shader with per-container diagnostics.
+pub fn translate_with_options(
+    container: &[u8],
+    options: ProgramOptions<'_>,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -295,7 +357,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with_options(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -307,7 +369,20 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_with_wave_retries(c, native, p, st, io, res);
+    emit_with_options(c, native, p, st, io, res, ProgramOptions::default())
+}
+
+/// Emits a program whose earlier stages already ran, with per-container diagnostics.
+pub fn emit_with_options(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: ProgramOptions<'_>,
+) -> Result<HostShader, ShaderError> {
+    let original = emit_with_wave_retries(c, native, p, st, io, res, options);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -321,7 +396,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_with_wave_retries(c, native, &p, &st, &io, &res)
+    emit_with_wave_retries(c, native, &p, &st, &io, &res, options)
 }
 
 fn emit_with_wave_retries(
@@ -331,6 +406,7 @@ fn emit_with_wave_retries(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    options: ProgramOptions<'_>,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -350,11 +426,16 @@ fn emit_with_wave_retries(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let program = if why && !options.hash.is_empty() {
+            format!(" #{}", options.hash)
+        } else {
+            String::new()
+        };
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY{program} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY{program} {what}: {e}"),
                 }
             }
         };
@@ -372,7 +453,7 @@ fn emit_with_wave_retries(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY{program} local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -415,7 +496,12 @@ fn emit_with_wave_retries(
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep_on = deep_skips_enabled() && !options.excludes_deep_skips();
+                if why && options.excludes_deep_skips() {
+                    eprintln!(
+                        "WAVE64-RETRY{program} without skips, scalars followed: excluded by VICTORY_WAVE_DEEP_SKIPS_NOT"
+                    );
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -779,6 +865,15 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn deep_skip_exclusions_require_full_case_insensitive_hashes() {
+        let excluded = super::wave_hashes(" A001000000000001,not-a-hash,0123, b002000000000002,");
+        assert_eq!(excluded, [0xa001_0000_0000_0001, 0xb002_0000_0000_0002]);
+        assert!(excluded.contains(&super::wave_hash("a001000000000001").unwrap()));
+        assert!(!excluded.contains(&super::wave_hash("a001000000000002").unwrap()));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

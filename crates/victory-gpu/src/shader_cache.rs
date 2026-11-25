@@ -91,11 +91,25 @@ fn build() -> &'static [u8; 32] {
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(container: &[u8], hash: &str) -> Result<HostShader, String> {
+    let options = victory_shader::emit::ProgramOptions::for_hash(hash);
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_with_options(c, options).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            let build = program_build(build(), options.excludes_deep_skips());
+            cached(cache, &build, container, translate)
+        }
         None => translate(container),
+    }
+}
+
+fn program_build(build: &[u8; 32], exclude_deep_skips: bool) -> [u8; 32] {
+    if exclude_deep_skips {
+        *blake3::keyed_hash(build, b"wave64-deep-skips-excluded").as_bytes()
+    } else {
+        *build
     }
 }
 
@@ -333,6 +347,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave64_deep_skip_exclusion_changes_only_its_program_key() {
+        let build = [7; 32];
+        let excluded = program_build(&build, true);
+        assert_ne!(excluded, build);
+        assert_eq!(program_build(&build, true), excluded);
+        assert_eq!(program_build(&build, false), build);
+    }
 
     fn shader() -> HostShader {
         HostShader {

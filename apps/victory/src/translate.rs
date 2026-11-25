@@ -309,7 +309,7 @@ pub fn run(
 fn translate(
     source: &Source,
     path: &Path,
-    seen: &Mutex<HashSet<blake3::Hash>>,
+    seen: &Mutex<HashSet<(blake3::Hash, bool)>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -365,7 +365,8 @@ fn translate(
             let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
-    if !lock(seen).insert(code) {
+    let options = emit::ProgramOptions::for_hash(&hash);
+    if !lock(seen).insert((code, options.excludes_deep_skips())) {
         t.duplicates += 1;
         if t.list {
             t.lines.push(format!("{}  duplicate", example()));
@@ -380,7 +381,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, programs, &example, t, checks, options);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -393,7 +394,14 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+    options: emit::ProgramOptions<'_>,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -457,7 +465,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    match emit::emit_with_options(container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
