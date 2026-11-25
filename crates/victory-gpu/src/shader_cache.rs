@@ -43,7 +43,17 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // A diagnostic run may borrow another executable's cache key when
+        // the shader translator is unchanged. The translation settings
+        // below still have to match. From Belobug's ccab9730bc.
+        let exe = std::env::var_os("VICTORY_SHADER_BUILD_OF")
+            .filter(|_| cfg!(feature = "diagnostics"))
+            .map_or_else(std::env::current_exe, |path| {
+                let path = PathBuf::from(path);
+                tracing::warn!(of = %path.display(), "using the shader cache key of another build");
+                Ok(path)
+            })
+            .and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
