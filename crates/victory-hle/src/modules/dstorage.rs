@@ -938,6 +938,30 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// Read a physical-page list without borrowing memory the title may still
+/// be filling. The kernel also reports lists whose memory is unreadable.
+fn read_page_list(source: *const c_void, pages: &mut [usize]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let bytes = std::mem::size_of_val(pages);
+    if bytes == 0 {
+        return true;
+    }
+    let mut read = 0;
+    // SAFETY: pages is writable for bytes; the kernel probes the source.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            source,
+            pages.as_mut_ptr().cast(),
+            bytes,
+            &mut read,
+        )
+    };
+    ok != 0 && read == bytes
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -958,36 +982,53 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let mut pages = vec![0; (offset + len).div_ceil(PAGE)];
+    if !read_page_list(request.destination, &mut pages) {
+        tracing::warn!(offset, len, pages = pages.len(), "dstorage: could not read a physical-page list");
+        return Err(E_INVALIDARG);
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        // Said aloud: the title never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
+        return Ok(());
     }
+    // Page zero is invalid. The queue can start a request while the title
+    // is still filling its list. Re-read it after decoding, then give the
+    // producer a bounded opportunity to finish before failing the request.
+    if pages.contains(&0) {
+        for attempt in 0..=8 {
+            if attempt != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if !read_page_list(request.destination, &mut pages) {
+                break;
+            }
+            if !pages.contains(&0) {
+                if super::xmem::write_physical(&pages, offset, &data[..n]) {
+                    static RECOVERED: AtomicU32 = AtomicU32::new(0);
+                    let recovered = RECOVERED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    if recovered.is_power_of_two() {
+                        tracing::info!(recovered, "dstorage: a late physical-page list was written");
+                    }
+                    return Ok(());
+                }
+                break;
+            }
+        }
+    }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        zero_pages = pages.iter().filter(|&&page| page == 0).count(),
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1494,6 +1535,39 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    #[test]
+    fn a_physical_page_list_completed_during_decode_is_read_again() {
+        use crate::modules::xmem;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut page = 0;
+        let mut count = 1;
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut count, &mut page), 1);
+        let destination = AtomicUsize::new(0);
+        let plain = pattern(128);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            std::ptr::from_ref(&destination).cast_mut().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        assert_eq!(
+            into_destination(&r, plain.len(), |out| {
+                out.copy_from_slice(&plain);
+                destination.store(page, Ordering::Release);
+                Ok(out.len())
+            }),
+            Ok(())
+        );
+        {
+            let mut view = xmem::page_window(&[page], 0, plain.len()).unwrap();
+            assert_eq!(view.bytes(), plain);
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(1, &page), 1);
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
