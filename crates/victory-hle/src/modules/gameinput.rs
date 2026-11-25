@@ -1240,44 +1240,72 @@ mod host {
 
     /// A second schedule can be timed from a marker created after the
     /// playable scene comes up, instead of from the first input poll.
+    /// Publish each command by renaming a temporary file to the marker path.
+    /// The marker is consumed on read. An empty marker uses `VICTORY_PLAY_KEYS`;
+    /// text in the marker uses the `VICTORY_KEYS` format and replaces any
+    /// schedule already in progress.
     #[cfg(feature = "diagnostics")]
     static PLAY_SCRIPT: LazyLock<Option<std::sync::Mutex<PlayScript>>> = LazyLock::new(|| {
         let marker = std::env::var_os("VICTORY_PLAY_INPUT_MARKER")?.into();
-        let keys = parse_script(&std::env::var("VICTORY_PLAY_KEYS").ok()?);
-        (!keys.is_empty()).then(|| {
-            std::sync::Mutex::new(PlayScript {
-                marker,
-                keys,
-                started: None,
-                next_check: Duration::ZERO,
-            })
-        })
+        let fallback = parse_script(&std::env::var("VICTORY_PLAY_KEYS").unwrap_or_default());
+        Some(std::sync::Mutex::new(PlayScript {
+            marker,
+            fallback,
+            active: None,
+            next_check: Duration::ZERO,
+        }))
     });
 
     #[cfg(feature = "diagnostics")]
     struct PlayScript {
         marker: std::path::PathBuf,
-        keys: Vec<ScriptedKey>,
-        started: Option<Duration>,
+        fallback: Vec<ScriptedKey>,
+        active: Option<(Duration, Vec<ScriptedKey>)>,
         next_check: Duration,
     }
 
     #[cfg(feature = "diagnostics")]
     impl PlayScript {
         fn keys(&mut self, elapsed: Duration, down: &mut Vec<u8>) {
-            if self.started.is_none() && elapsed >= self.next_check {
+            if elapsed >= self.next_check {
                 self.next_check = elapsed.saturating_add(Duration::from_millis(200));
-                if self.marker.is_file() {
-                    self.started = Some(elapsed);
-                    tracing::info!("headless gameplay input started");
-                }
+                self.read_marker(elapsed);
             }
-            if let Some(started) = self.started {
-                let now = elapsed - started;
-                down.extend(self.keys.iter().filter_map(|(hold, vk)| {
+            if let Some((started, keys)) = &mut self.active {
+                let now = elapsed - *started;
+                keys.retain(|(hold, _)| now < hold.end);
+                down.extend(keys.iter().filter_map(|(hold, vk)| {
                     hold.contains(&now).then_some(*vk)
                 }));
+                if keys.is_empty() {
+                    self.active = None;
+                }
             }
+        }
+
+        fn read_marker(&mut self, elapsed: Duration) {
+            let Ok(content) = std::fs::read(&self.marker) else {
+                return;
+            };
+            if std::fs::remove_file(&self.marker).is_err() {
+                return;
+            }
+            let Ok(content) = std::str::from_utf8(&content) else {
+                tracing::warn!("headless gameplay input marker is not UTF-8");
+                return;
+            };
+            let command = content.trim_start_matches('\u{feff}').trim();
+            let keys = if command.is_empty() {
+                self.fallback.clone()
+            } else {
+                parse_script(command)
+            };
+            if keys.is_empty() {
+                tracing::warn!("headless gameplay input marker contained no scheduled keys");
+                return;
+            }
+            tracing::info!(key_count = keys.len(), "headless gameplay input started");
+            self.active = Some((elapsed, keys));
         }
     }
 
@@ -1340,25 +1368,53 @@ mod host {
 
     #[cfg(all(test, feature = "diagnostics"))]
     #[test]
-    fn a_marker_starts_the_second_input_schedule() {
+    fn a_marker_starts_and_rearms_the_second_input_schedule() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("input");
         let mut script = PlayScript {
             marker: marker.clone(),
-            keys: parse_script("1:J:2"),
-            started: None,
+            fallback: parse_script("1:J:2"),
+            active: None,
             next_check: Duration::ZERO,
         };
         let mut down = Vec::new();
         script.keys(Duration::from_secs(100), &mut down);
         assert!(down.is_empty());
-        std::fs::write(marker, []).unwrap();
+        std::fs::write(&marker, []).unwrap();
         script.keys(Duration::from_secs(101), &mut down);
         assert!(down.is_empty());
+        assert!(!marker.exists());
         script.keys(Duration::from_secs(102), &mut down);
         assert_eq!(down, [b'J']);
         down.clear();
+        std::fs::write(&marker, "invalid").unwrap();
+        script.keys(Duration::from_millis(102_500), &mut down);
+        assert_eq!(down, [b'J']);
+        assert!(!marker.exists());
+        down.clear();
+        std::fs::write(&marker, [0xff]).unwrap();
+        script.keys(Duration::from_secs(103), &mut down);
+        assert_eq!(down, [b'J']);
+        assert!(!marker.exists());
+        down.clear();
         script.keys(Duration::from_secs(104), &mut down);
+        assert!(down.is_empty());
+        assert!(script.active.is_none());
+
+        std::fs::write(&marker, "0:L:2").unwrap();
+        script.keys(Duration::from_secs(105), &mut down);
+        assert_eq!(down, [b'L']);
+        assert!(!marker.exists());
+        down.clear();
+        std::fs::write(&marker, "0:L:2").unwrap();
+        script.keys(Duration::from_secs(106), &mut down);
+        assert_eq!(down, [b'L']);
+        assert!(!marker.exists());
+        down.clear();
+        script.keys(Duration::from_millis(107_500), &mut down);
+        assert_eq!(down, [b'L']);
+        down.clear();
+        script.keys(Duration::from_secs(108), &mut down);
         assert!(down.is_empty());
     }
 
