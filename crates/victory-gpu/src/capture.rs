@@ -45,8 +45,15 @@ pub(crate) fn listed(n: u64) -> bool {
             .filter_map(|f| f.trim().parse().ok())
             .collect()
     });
-    // A file named `now` in the capture folder: the next three frames are
-    // captured (and the file removed), to catch a view on demand.
+    let on_demand = on_demand(n);
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let after = n.wrapping_sub(first);
+    named || on_demand || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+// A file named `now` in the capture folder: the next three frames are
+// captured (and the file removed), to catch a view on demand.
+fn on_demand(n: u64) -> bool {
     static CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     use std::sync::atomic::Ordering::Relaxed;
@@ -57,10 +64,7 @@ pub(crate) fn listed(n: u64) -> bool {
         NOW.store(n + 1, Relaxed);
     }
     let now = NOW.load(Relaxed);
-    let on_demand = now != u64::MAX && n >= now && n < now + 3;
-    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let after = n.wrapping_sub(first);
-    named || on_demand || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    now != u64::MAX && n >= now && n < now + 3
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -343,24 +347,42 @@ pub(crate) fn save_read_back(
     }
 }
 
-/// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
-/// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
-/// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
+/// With `VICTORY_DUMP_TARGETS` set: title textures the listed frames render
+/// to or write, in first-use order, saved at that frame's present as
+/// `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
+/// `VICTORY_DUMP_TARGETS=on-demand` limits these dumps to frames triggered
+/// by the `now` file.
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+enum TargetDump {
+    Off,
+    Listed,
+    OnDemand,
+}
+
+fn dump_frame(frame: u64) -> bool {
+    static MODE: std::sync::OnceLock<TargetDump> = std::sync::OnceLock::new();
+    match MODE.get_or_init(
+        || match std::env::var_os("VICTORY_DUMP_TARGETS").filter(|_| folder().is_some()) {
+            Some(value) if value == "on-demand" => TargetDump::OnDemand,
+            Some(_) => TargetDump::Listed,
+            None => TargetDump::Off,
+        },
+    ) {
+        TargetDump::Off => false,
+        TargetDump::Listed => listed(frame),
+        TargetDump::OnDemand => on_demand(frame),
+    }
 }
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_frame(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
