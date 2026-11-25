@@ -471,6 +471,8 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    section: Arc<Section>,
+    offset: u64,
 }
 
 impl View {
@@ -491,7 +493,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, section: Arc::clone(&slice.section), offset };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -500,6 +502,10 @@ impl View {
         // alone while `self` lives (other views of the slices only alias
         // them, as the console's do).
         unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+    }
+
+    fn written(&self, offset: usize, len: usize) {
+        victory_gpu::title_memory_written(self.section.0 as usize, self.offset + offset as u64, len);
     }
 }
 
@@ -552,6 +558,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        view.written(within, k);
         (within, done) = (0, done + k);
     }
     true
@@ -570,6 +577,10 @@ impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    pub(crate) fn written(&self, len: usize) {
+        self.view.written(self.within, len.min(self.len));
     }
 }
 

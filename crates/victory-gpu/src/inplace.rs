@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -267,11 +267,29 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// By (section, page offset, virtual address). A physical write can
+    /// find all mapped aliases without scanning unrelated title views.
+    pages: BTreeSet<(usize, u64, usize)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+impl Views {
+    fn forget(&mut self, at: usize) {
+        if let Some((len, section, offset)) = self.views.remove(&at) {
+            for page in view_pages(at, len, section, offset) {
+                self.pages.remove(&page);
+            }
+        }
+    }
+}
+
+fn view_pages(at: usize, len: usize, section: usize, offset: u64) -> impl Iterator<Item = (usize, u64, usize)> {
+    (0..len).step_by(K64).map(move |delta| (section, offset + delta as u64, at + delta))
+}
+
+static VIEWS: Mutex<Views> =
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeSet::new(), sections: Vec::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -286,9 +304,13 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
-/// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
+/// `offset` on, all aligned to 64 KiB pages. Call after
+/// [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let mut v = views();
+    v.forget(at);
+    v.views.insert(at, (len, section, offset));
+    v.pages.extend(view_pages(at, len, section, offset));
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -296,15 +318,42 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
     let mut v = views();
-    if v.views.is_empty() {
+    if len == 0 || v.views.is_empty() {
         return;
     }
     let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        v.forget(base);
     }
+}
+
+/// Virtual address ranges that show the written bytes of a section.
+pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    let end = offset.saturating_add(len as u64);
+    if end <= offset {
+        return Vec::new();
+    }
+    let page = offset - offset % K64 as u64;
+    let mut ranges: Vec<_> = views()
+        .pages
+        .range((section, page, 0)..(section, end, 0))
+        .map(|&(_, page, at)| {
+            let start = page.max(offset);
+            let end = page.saturating_add(K64 as u64).min(end);
+            (at + (start - page) as usize, (end - start) as usize)
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (at, len) in ranges {
+        match merged.last_mut() {
+            Some((start, size)) if *start + *size == at => *size += len,
+            _ => merged.push((at, len)),
+        }
+    }
+    merged
 }
 
 /// How the views cover `[at, at + len)`.
@@ -1048,10 +1097,12 @@ mod tests {
         title_memory_view(at, 4 * K64, 77, 0);
         title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64);
         assert_eq!(cover(at, 5 * K64), Cover::Run(77, 0));
+        assert_eq!(views_of_section(77, K64 as u64 - 8, 16), [(at + K64 - 8, 16)]);
         // One page inside the first view goes: the whole view is forgotten
         // (the runtime maps and tells again what stays of it).
         views_gone(at + K64, K64);
         assert_eq!(cover(at, K64), Cover::None);
+        assert!(views_of_section(77, 0, 4 * K64).is_empty());
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
